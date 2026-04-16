@@ -1,33 +1,204 @@
-import asyncio
+"""
+AI Search Agent - Telegram Bot
+Исправленная версия: gemini-2.5-flash + обход rate limit DuckDuckGo
+"""
+
 import os
 import sys
-from typing import Optional
+import asyncio
+import logging
+import time
+import random
+from typing import List, Dict, Any
 
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, BotCommand
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
+# === Настройка логирования ===
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("search_bot")
 
-# Загружаем .env для локальной разработки
-load_dotenv()
-
-# Добавляем путь для импортов
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from core.agent import process_user_request, get_stats
-from utils.logger import setup_logger
-
-logger = setup_logger("bot")
-
-# === Конфигурация ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN не найден в переменных окружения!")
+# === Импорты ===
+try:
+    from dotenv import load_dotenv
+    from aiogram import Bot, Dispatcher, types
+    from aiogram.filters import Command
+    from aiogram.types import Message, BotCommand
+    from aiogram.enums import ParseMode
+    from aiogram.client.default import DefaultBotProperties
+    import google.generativeai as genai
+    from duckduckgo_search import DDGS
+except ImportError as e:
+    logger.error(f"Ошибка импорта: {e}")
     sys.exit(1)
 
-# === Инициализация бота ===
+load_dotenv()
+
+# === Конфигурация ===
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not GEMINI_API_KEY or not BOT_TOKEN:
+    logger.error("Отсутствуют ключи API!")
+    sys.exit(1)
+
+# === Настройка Gemini (ИСПРАВЛЕНО: новая модель) ===
+genai.configure(api_key=GEMINI_API_KEY)
+MODEL_NAME = "gemini-2.5-flash"  # <-- ВОТ ГЛАВНОЕ ИСПРАВЛЕНИЕ
+MODEL = genai.GenerativeModel(MODEL_NAME)
+logger.info(f"Gemini API настроен с моделью {MODEL_NAME}")
+
+
+# ========== ЛОГИКА АГЕНТА ==========
+
+async def text_to_search_query(user_input: str) -> str:
+    """Превращает естественный язык в поисковый запрос."""
+    prompt = f"""
+Преврати запрос в поисковую фразу для поиска товара.
+Выдели товар, бренд, модель. Добавь "купить" или "цена".
+Верни ТОЛЬКО поисковую фразу, без пояснений.
+
+Пример: "найди айфон 15 про" → iPhone 15 Pro купить цена
+
+Запрос: "{user_input}"
+Поисковая фраза:
+"""
+    try:
+        response = await MODEL.generate_content_async(prompt)
+        query = response.text.strip()
+        logger.info(f"Поисковый запрос: {query}")
+        return query
+    except Exception as e:
+        logger.error(f"Ошибка Gemini: {e}")
+        return user_input
+
+
+def search_duckduckgo(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    """
+    Поиск через DuckDuckGo с обходом rate limit.
+    Добавлена задержка и смена региона при ошибке.
+    """
+    results = []
+    regions = ['wt-wt', 'ru-ru', 'us-en']  # Пробуем разные регионы
+    
+    for region in regions:
+        try:
+            # Небольшая задержка перед запросом (обходит rate limit)
+            time.sleep(random.uniform(1.0, 2.0))
+            
+            with DDGS() as ddgs:
+                for r in ddgs.text(
+                    query,
+                    region=region,
+                    safesearch='moderate',
+                    max_results=max_results
+                ):
+                    results.append({
+                        'title': r.get('title', 'Без названия'),
+                        'snippet': r.get('body', ''),
+                        'link': r.get('href', ''),
+                        'source': r.get('source', 'неизвестно')
+                    })
+            
+            if results:
+                logger.info(f"Найдено результатов: {len(results)} (регион {region})")
+                break
+                
+        except Exception as e:
+            logger.warning(f"Попытка с регионом {region} не удалась: {e}")
+            continue
+    
+    return results
+
+
+async def analyze_results(
+    user_query: str,
+    search_query: str,
+    results: List[Dict[str, str]]
+) -> str:
+    """Анализирует результаты и находит лучшее предложение."""
+    if not results:
+        return "❌ Ничего не найдено. Попробуй переформулировать запрос."
+
+    results_text = ""
+    for i, r in enumerate(results, 1):
+        results_text += f"""
+{i}. **{r['title']}**
+   📝 {r['snippet'][:150]}...
+   🔗 {r['link']}
+"""
+
+    prompt = f"""
+Ты — ассистент по поиску выгодных покупок.
+
+Пользователь искал: "{user_query}"
+Поисковый запрос: "{search_query}"
+
+Результаты:
+{results_text}
+
+Найди предложение с самой низкой ценой (если цены указаны).
+Если цен нет, выбери самое надёжное предложение.
+
+Ответь в формате:
+
+🔥 **Лучшее предложение:**
+[Название и цена]
+🔗 [Ссылка]
+
+💡 **Альтернатива:**
+[Название и ссылка] (если есть)
+"""
+    try:
+        response = await MODEL.generate_content_async(prompt)
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Ошибка анализа: {e}")
+        first = results[0]
+        return f"""
+🔥 **Лучшее предложение:**
+{first['title']}
+🔗 {first['link']}
+"""
+
+
+async def process_user_request(user_text: str) -> str:
+    """Главная функция обработки запроса."""
+    logger.info(f"Запрос: {user_text[:50]}...")
+
+    try:
+        # 1. Понимание запроса
+        search_query = await text_to_search_query(user_text)
+
+        # 2. Поиск (в отдельном потоке)
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, search_duckduckgo, search_query, 5)
+
+        # 3. Анализ
+        best_offer = await analyze_results(user_text, search_query, results)
+
+        # 4. Ответ
+        header = f"🔍 **Поиск:** `{search_query}`"
+        footer = f"\n\n📊 *Найдено: {len(results)}*" if results else ""
+
+        return f"{header}\n\n{best_offer}{footer}"
+
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        return f"⚠️ Ошибка. Попробуй позже."
+
+
+def get_stats() -> Dict[str, str]:
+    return {
+        "model": MODEL_NAME,
+        "search": "DuckDuckGo",
+        "status": "active"
+    }
+
+
+# ========== ТЕЛЕГРАМ БОТ ==========
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
@@ -35,169 +206,97 @@ bot = Bot(
 dp = Dispatcher()
 
 
-# === Команды ===
-
 async def set_commands(bot: Bot):
-    """Устанавливает список команд в меню бота."""
     commands = [
-        BotCommand(command="start", description="🚀 Начать работу"),
-        BotCommand(command="help", description="❓ Как пользоваться"),
+        BotCommand(command="start", description="🚀 Начать"),
+        BotCommand(command="help", description="❓ Помощь"),
         BotCommand(command="stats", description="📊 Статистика"),
-        BotCommand(command="about", description="ℹ️ О боте"),
     ]
     await bot.set_my_commands(commands)
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    """Приветственное сообщение."""
-    welcome_text = """
-👋 **Привет! Я AI-агент для поиска выгодных покупок.**
+    await message.answer("""
+👋 **Привет! Я AI-агент для поиска товаров.**
 
-Я умею:
-🔍 Находить товары по твоему описанию
-💰 Сравнивать цены в разных магазинах
-🎯 Выбирать самое выгодное предложение
+🔍 Нахожу товары по описанию
+💰 Сравниваю цены
+🎯 Выбираю лучшее предложение
 
-**Как пользоваться:**
-Просто напиши мне, что хочешь найти.
+**Примеры:**
+• `найди iphone 15 pro`
+• `робот пылесос xiaomi`
+• `утюг philips цена`
 
-*Примеры запросов:*
-• `найди iphone 15 pro 256gb`
-• `робот пылесос xiaomi недорого`
-• `утюг philips с паром цена`
-• `беспроводные наушники sony wh-1000xm5`
-
-Я проанализирую рынок и пришлю лучшее предложение! 🚀
-"""
-    await message.answer(welcome_text)
+Просто напиши, что хочешь найти!
+""")
     logger.info(f"Пользователь {message.from_user.id} запустил бота")
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    """Справка по использованию."""
-    help_text = """
-❓ **Как мной пользоваться**
+    await message.answer("""
+❓ **Как пользоваться**
 
 1️⃣ Напиши, что хочешь найти
-2️⃣ Я преобразую запрос в поисковую фразу
-3️⃣ Найду результаты через DuckDuckGo
-4️⃣ Проанализирую с помощью ИИ
-5️⃣ Пришлю лучшее предложение
+2️⃣ Я найду результаты
+3️⃣ Проанализирую с помощью ИИ
+4️⃣ Пришлю лучшее предложение
 
-**Советы для лучшего результата:**
+**Советы:**
 • Указывай бренд и модель
-• Пиши ключевые характеристики
 • Добавляй "цена" или "купить"
 
-**Ограничения:**
-• Бесплатный поиск через DuckDuckGo
-• Анализ 5 первых результатов
-• Время ответа: 5-10 секунд
-
-*По вопросам и предложениям: @your_username*
-"""
-    await message.answer(help_text)
+*Время ответа: 5-10 секунд*
+""")
 
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    """Показывает статистику работы."""
     stats = get_stats()
-    stats_text = f"""
-📊 **Статистика бота**
+    await message.answer(f"""
+📊 **Статистика**
 
-🔧 Модель ИИ: `{stats['model']}`
-🌐 Поисковая система: `{stats['search_engine']}`
+🔧 Модель: `{stats['model']}`
+🌐 Поиск: `{stats['search']}`
 ✅ Статус: `{stats['status']}`
+""")
 
-*Бот работает стабильно.*
-"""
-    await message.answer(stats_text)
-
-
-@dp.message(Command("about"))
-async def cmd_about(message: Message):
-    """Информация о боте."""
-    about_text = """
-ℹ️ **О боте**
-
-**AI Search Agent v1.0**
-
-Создан как демонстрация возможностей AI-агентов для автоматизации поиска и сравнения цен.
-
-**Технологии:**
-• Google Gemini 1.5 Flash (анализ)
-• DuckDuckGo (поиск)
-• Aiogram 3.x (Telegram API)
-
-**Возможности:**
-• Понимание естественного языка
-• Умный анализ выдачи
-• Выбор оптимального предложения
-
-*Бот работает 24/7*
-"""
-    await message.answer(about_text)
-
-
-# === Обработка текстовых сообщений ===
 
 @dp.message()
 async def handle_text(message: Message):
-    """Обработка любого текста как поискового запроса."""
-    user_id = message.from_user.id
     user_text = message.text.strip()
-    
-    # Игнорируем слишком короткие запросы
+
     if len(user_text) < 3:
-        await message.answer("⚠️ Слишком короткий запрос. Напиши, что именно хочешь найти.")
+        await message.answer("⚠️ Слишком коротко. Напиши, что искать.")
         return
-    
-    logger.info(f"Запрос от {user_id}: {user_text[:50]}...")
-    
-    # Отправляем "печатает..."
+
     await bot.send_chat_action(message.chat.id, action="typing")
-    
-    # Отправляем промежуточное сообщение
     status_msg = await message.answer("🔍 *Ищу информацию...*")
-    
+
     try:
-        # Вызываем агента
         response = await process_user_request(user_text)
-        
-        # Редактируем сообщение с результатом
         await status_msg.edit_text(
-            response, 
+            response,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=False
         )
-        
     except Exception as e:
-        logger.error(f"Ошибка обработки запроса: {e}", exc_info=True)
-        await status_msg.edit_text(
-            "❌ *Произошла ошибка.*\n\n"
-            "Пожалуйста, попробуй позже или переформулируй запрос.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        logger.error(f"Ошибка: {e}")
+        await status_msg.edit_text("❌ Ошибка. Попробуй позже.")
 
 
-# === Запуск ===
+# ========== ЗАПУСК ==========
 
 async def main():
-    """Точка входа."""
     logger.info("Запуск бота...")
-    
-    # Устанавливаем команды
     await set_commands(bot)
-    
-    # Запускаем поллинг
     try:
-        logger.info("Бот запущен и готов к работе!")
+        logger.info("Бот запущен!")
         await dp.start_polling(bot)
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        logger.error(f"Критическая ошибка: {e}")
     finally:
         await bot.session.close()
 
@@ -206,6 +305,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен вручную")
+        logger.info("Бот остановлен")
     except Exception as e:
-        logger.error(f"Необработанная ошибка: {e}", exc_info=True)
+        logger.error(f"Ошибка запуска: {e}")
