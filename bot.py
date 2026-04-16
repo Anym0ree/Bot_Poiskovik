@@ -1,6 +1,6 @@
 """
 AI Search Agent - Telegram Bot
-Продвинутая версия: прозрачный поиск, объяснение выбора, высокая стабильность
+Продвинутая версия: топ-3 предложения, прозрачный поиск, объяснение выбора
 """
 
 import os
@@ -9,7 +9,7 @@ import asyncio
 import logging
 import aiohttp
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 # === Настройка логирования ===
 logging.basicConfig(
@@ -53,11 +53,12 @@ client = AsyncOpenAI(
     }
 )
 PRIMARY_MODEL = "google/gemini-2.0-flash-exp:free"
-FALLBACK_MODEL = "openai/gpt-4o-mini" # Платная, но дешёвая модель для подстраховки
+FALLBACK_MODEL = "openai/gpt-4o-mini"
 
 logger.info(f"Основная ИИ-модель: {PRIMARY_MODEL}")
 logger.info(f"Резервная ИИ-модель: {FALLBACK_MODEL}")
 logger.info("Serper API настроен")
+
 
 # ========== УМНАЯ ЛОГИКА АГЕНТА ==========
 
@@ -85,6 +86,7 @@ async def call_llm(prompt: str, temperature: float = 0.1, max_tokens: int = 100)
             logger.error(f"Ошибка и у резервной модели: {fallback_e}")
             raise fallback_e
 
+
 async def text_to_search_query(user_input: str) -> str:
     """Превращает запрос в оптимизированную поисковую фразу."""
     prompt = f"""
@@ -104,6 +106,7 @@ async def text_to_search_query(user_input: str) -> str:
     except Exception as e:
         logger.error(f"Ошибка формирования запроса: {e}")
         return user_input
+
 
 async def search_serper(query: str, num_results: int = 5) -> List[Dict[str, Any]]:
     """Поиск через Serper.dev с оптимизацией."""
@@ -126,7 +129,6 @@ async def search_serper(query: str, num_results: int = 5) -> List[Dict[str, Any]
         
         results = []
         for item in data.get("organic", [])[:num_results]:
-            # Исключаем заведомо нерелевантные сайты
             if "pinterest.com" in item.get("link", "") or "youtube.com" in item.get("link", ""):
                 continue
                 
@@ -135,7 +137,7 @@ async def search_serper(query: str, num_results: int = 5) -> List[Dict[str, Any]
                 "snippet": item.get("snippet", ""),
                 "link": item.get("link", ""),
                 "source": item.get("source", item.get("displayLink", "неизвестно")),
-                "price": item.get("price") # Serper иногда отдаёт цену отдельно
+                "price": item.get("price")
             })
         
         logger.info(f"Serper: найдено {len(results)} результатов по запросу '{query}'")
@@ -145,16 +147,18 @@ async def search_serper(query: str, num_results: int = 5) -> List[Dict[str, Any]
         logger.error(f"Ошибка Serper: {e}")
         return []
 
+
 async def analyze_results(
     user_query: str,
     search_query: str,
     results: List[Dict[str, Any]]
-) -> Dict[str, str]:
-    """
-    Анализирует результаты, возвращая не только ответ, но и его обоснование.
-    """
+) -> Dict[str, Any]:
+    """Анализирует результаты и возвращает топ-3 с объяснением выбора лучшего."""
     if not results:
-        return {"answer": "❌ Ничего не найдено.", "reason": ""}
+        return {
+            "top_offers": [],
+            "reason": "Ничего не найдено."
+        }
 
     results_text = ""
     for i, r in enumerate(results, 1):
@@ -163,11 +167,11 @@ async def analyze_results(
 {i}. **{r['title']}**{price_info}
    📝 {r['snippet'][:150]}...
    🔗 {r['link']}
-   📦 Источник: {r['source']}
+   📦 {r['source']}
 """
 
     prompt = f"""
-Ты — эксперт по поиску выгодных покупок. Проанализируй результаты поиска Google и выбери лучшее предложение для пользователя.
+Ты — эксперт по поиску выгодных покупок. Проанализируй результаты поиска Google.
 
 Пользователь искал: "{user_query}"
 Поисковый запрос: "{search_query}"
@@ -176,51 +180,75 @@ async def analyze_results(
 {results_text}
 
 Твоя задача:
-1. Внимательно проанализируй сниппеты. Найди в них упоминания цен.
-2. Если цены указаны, выбери предложение с самой низкой ценой.
-3. Если цен нет, выбери самое надёжное предложение от известного магазина (например, DNS, Ситилинк, М.Видео, Ozon, Wildberries, официальный сайт бренда).
-4. ОБЯЗАТЕЛЬНО объясни свой выбор.
+1. Отранжируй предложения от лучшего к худшему по критерию: цена (чем ниже, тем лучше) → надёжность магазина (известные сети, официальные сайты) → релевантность.
+2. Выбери ТОП-3 лучших предложения.
+3. Для лучшего (первого) предложения напиши краткое объяснение: почему именно оно признано лучшим.
 
 Верни ответ СТРОГО в формате JSON:
 {{
-  "best_offer_title": "Название лучшего предложения",
-  "best_offer_link": "Ссылка",
-  "best_offer_price": "Цена, если найдена",
-  "reason": "Чёткое и краткое объяснение: почему выбрано именно это. Например: 'Найдена самая низкая цена — 7990 руб.' или 'Цены не указаны, но это официальный сайт бренда, которому можно доверять.'"
+  "top_offers": [
+    {{
+      "title": "Название предложения 1",
+      "link": "Ссылка",
+      "price": "Цена или 'Не указана'",
+      "source": "Источник"
+    }},
+    {{
+      "title": "Название предложения 2",
+      "link": "Ссылка",
+      "price": "Цена или 'Не указана'",
+      "source": "Источник"
+    }},
+    {{
+      "title": "Название предложения 3",
+      "link": "Ссылка",
+      "price": "Цена или 'Не указана'",
+      "source": "Источник"
+    }}
+  ],
+  "reason": "Краткое объяснение: почему первое предложение лучшее. Например: 'Самая низкая цена (7990 руб.) среди всех предложений' или 'Официальный сайт бренда, цена не указана, но это самый надёжный источник.'"
 }}
 """
     try:
-        response = await call_llm(prompt, temperature=0.3, max_tokens=500)
+        response = await call_llm(prompt, temperature=0.3, max_tokens=800)
         
-        # Пытаемся распарсить JSON
         try:
-            # Находим JSON в ответе
             json_start = response.find('{')
             json_end = response.rfind('}') + 1
             json_str = response[json_start:json_end]
             analysis = json.loads(json_str)
-            logger.info(f"Анализ выполнен успешно: {analysis.get('reason')}")
+            logger.info(f"Анализ выполнен успешно, найдено предложений: {len(analysis.get('top_offers', []))}")
             return analysis
         except json.JSONDecodeError:
             logger.warning("Не удалось распарсить JSON, использую fallback")
-            # Fallback: забираем первый результат
-            first = results[0]
+            top_offers = []
+            for r in results[:3]:
+                top_offers.append({
+                    "title": r['title'],
+                    "link": r['link'],
+                    "price": r.get('price', 'Не указана'),
+                    "source": r['source']
+                })
             return {
-                "best_offer_title": first['title'],
-                "best_offer_link": first['link'],
-                "best_offer_price": first.get('price', 'Цена не указана'),
-                "reason": "Автоматический выбор: первое и наиболее релевантное предложение в выдаче Google."
+                "top_offers": top_offers,
+                "reason": "Автоматический выбор: первые и наиболее релевантные предложения в выдаче Google."
             }
             
     except Exception as e:
         logger.error(f"Ошибка анализа: {e}")
-        first = results[0]
+        top_offers = []
+        for r in results[:3]:
+            top_offers.append({
+                "title": r['title'],
+                "link": r['link'],
+                "price": r.get('price', 'Не указана'),
+                "source": r['source']
+            })
         return {
-            "best_offer_title": first['title'],
-            "best_offer_link": first['link'],
-            "best_offer_price": first.get('price', 'Цена не указана'),
+            "top_offers": top_offers,
             "reason": "Автоматический выбор из-за технической ошибки анализа."
         }
+
 
 async def process_user_request(user_text: str) -> str:
     """Главная функция обработки запроса с расширенным ответом."""
@@ -237,21 +265,29 @@ async def process_user_request(user_text: str) -> str:
         analysis = await analyze_results(user_text, search_query, results)
 
         # 4. Формируем красивый ответ
-        header = f"🔍 **Поисковый запрос:** `{search_query}`"
+        header = f"🔍 **Поисковый запрос:** `{search_query}`\n"
         
-        offer_block = f"""
-🔥 **Лучшее предложение:**
-**{analysis.get('best_offer_title', 'Не найдено')}**
-💰 {analysis.get('best_offer_price', 'Цена не указана')}
-🔗 {analysis.get('best_offer_link', '')}
-"""
-        reason_block = f"""
-🧠 **Почему выбрано это:**
-{analysis.get('reason', 'Анализ не предоставлен.')}
-"""
+        offers_block = ""
+        top_offers = analysis.get('top_offers', [])
+        
+        if top_offers:
+            offers_block = "🏆 **ТОП-3 предложения:**\n\n"
+            medals = ["🥇", "🥈", "🥉"]
+            for i, offer in enumerate(top_offers):
+                medal = medals[i] if i < 3 else f"{i+1}."
+                offers_block += f"{medal} **{offer['title']}**\n"
+                offers_block += f"   💰 {offer['price']}\n"
+                offers_block += f"   📦 {offer['source']}\n"
+                offers_block += f"   🔗 {offer['link']}\n\n"
+        else:
+            offers_block = "❌ Ничего не найдено.\n"
+        
+        reason = analysis.get('reason', '')
+        reason_block = f"🧠 **Почему первое место лучшее:**\n{reason}\n" if reason else ""
+        
         footer = f"📊 *Проанализировано результатов: {len(results)}*"
 
-        full_response = f"{header}\n{offer_block}\n{reason_block}\n{footer}"
+        full_response = f"{header}\n{offers_block}{reason_block}{footer}"
         
         logger.info("Ответ сформирован")
         return full_response
@@ -260,12 +296,14 @@ async def process_user_request(user_text: str) -> str:
         logger.error(f"Ошибка обработки: {e}", exc_info=True)
         return f"⚠️ Внутренняя ошибка. Попробуй позже."
 
+
 def get_stats() -> Dict[str, str]:
     return {
         "model": f"{PRIMARY_MODEL} (резерв: {FALLBACK_MODEL})",
         "search": "Serper.dev (Google)",
         "status": "active"
     }
+
 
 # ========== ТЕЛЕГРАМ БОТ ==========
 
@@ -275,6 +313,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+
 async def set_commands(bot: Bot):
     commands = [
         BotCommand(command="start", description="🚀 Начать"),
@@ -283,6 +322,7 @@ async def set_commands(bot: Bot):
     ]
     await bot.set_my_commands(commands)
 
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer("""
@@ -290,7 +330,7 @@ async def cmd_start(message: Message):
 
 🔍 Нахожу товары по описанию
 💰 Сравниваю цены
-🎯 Выбираю лучшее предложение
+🎯 Выбираю ТОП-3 предложения
 🧠 Объясняю свой выбор
 
 **Примеры:**
@@ -302,6 +342,7 @@ async def cmd_start(message: Message):
 """)
     logger.info(f"Пользователь {message.from_user.id} запустил бота")
 
+
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer("""
@@ -310,7 +351,7 @@ async def cmd_help(message: Message):
 1️⃣ Напиши, что хочешь найти
 2️⃣ Я найду результаты через Google
 3️⃣ Проанализирую с помощью ИИ
-4️⃣ Пришлю лучшее предложение и объясню, почему выбрал его
+4️⃣ Пришлю ТОП-3 предложения и объясню выбор лучшего
 
 **Советы:**
 • Указывай бренд и модель
@@ -318,6 +359,7 @@ async def cmd_help(message: Message):
 
 *Время ответа: 5-10 секунд*
 """)
+
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
@@ -329,6 +371,7 @@ async def cmd_stats(message: Message):
 🌐 Поиск: `{stats['search']}`
 ✅ Статус: `{stats['status']}`
 """)
+
 
 @dp.message()
 async def handle_text(message: Message):
@@ -352,6 +395,7 @@ async def handle_text(message: Message):
         logger.error(f"Ошибка: {e}")
         await status_msg.edit_text("❌ Ошибка. Попробуй позже.")
 
+
 # ========== ЗАПУСК ==========
 
 async def main():
@@ -364,6 +408,7 @@ async def main():
         logger.error(f"Критическая ошибка: {e}")
     finally:
         await bot.session.close()
+
 
 if __name__ == "__main__":
     try:
