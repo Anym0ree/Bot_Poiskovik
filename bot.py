@@ -18,9 +18,7 @@ def ensure_tavily():
     try:
         import tavily
     except ImportError:
-        print("tavily not found, installing...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "tavily-python"])
-        print("tavily installed")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "tavily==0.5.0"])
 
 ensure_tavily()
 from tavily import TavilyClient
