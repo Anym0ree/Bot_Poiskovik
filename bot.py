@@ -1,7 +1,8 @@
 import re
 import logging
 from typing import List, Dict, Any, Optional
-
+from dotenv import load_dotenv
+load_dotenv()
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
