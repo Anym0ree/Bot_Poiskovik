@@ -11,6 +11,18 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import subprocess
+import sys
+
+def ensure_tavily():
+    try:
+        import tavily
+    except ImportError:
+        print("tavily not found, installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "tavily-python"])
+        print("tavily installed")
+
+ensure_tavily()
 from tavily import TavilyClient
 import os
 
