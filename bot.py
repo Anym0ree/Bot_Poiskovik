@@ -1,419 +1,233 @@
-"""
-AI Search Agent - Telegram Bot
-Продвинутая версия: топ-3 предложения, прозрачный поиск, объяснение выбора
-"""
-
-import os
-import sys
-import asyncio
+import re
 import logging
-import aiohttp
-import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-# === Настройка логирования ===
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
-logger = logging.getLogger("smart_search_bot")
+from tavily import TavilyClient
 
-# === Импорты ===
-try:
-    from dotenv import load_dotenv
-    from aiogram import Bot, Dispatcher, types
-    from aiogram.filters import Command
-    from aiogram.types import Message, BotCommand
-    from aiogram.enums import ParseMode
-    from aiogram.client.default import DefaultBotProperties
-    from openai import AsyncOpenAI
-except ImportError as e:
-    logger.error(f"Ошибка импорта: {e}")
-    sys.exit(1)
+# -------------------------------------------------------------------
+# НАСТРОЙКИ - ЗАМЕНИ НА СВОИ ТОКЕНЫ
+# -------------------------------------------------------------------
+TELEGRAM_TOKEN = "8795896150:AAFfyPQ8YCIJ7qvxdvHjQBwQoNxh7sCq4ss"   # Вставь сюда токен от @BotFather
+TAVILY_API_KEY = "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"       # Вставь сюда API-ключ Tavily (получить на tavily.com)
+# -------------------------------------------------------------------
 
-load_dotenv()
+# Логирование
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# === Конфигурация ===
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Список городов (можно расширить)
+CITIES = {
+    "москва", "санкт-петербург", "спб", "новосибирск", "екатеринбург",
+    "казань", "нижний новгород", "челябинск", "омск", "самара", "ростов-на-дону",
+    "уфа", "красноярск", "пермь", "воронеж", "волгоград", "краснодар"
+}
 
-if not all([OPENROUTER_API_KEY, SERPER_API_KEY, BOT_TOKEN]):
-    logger.error("Отсутствуют необходимые ключи API!")
-    sys.exit(1)
+# Регулярки для извлечения данных
+PRICE_REGEX = re.compile(r'(\d{1,3}(?:[ \d]{0,3})?(?:[.,]\d{2})?)\s*(?:₽|руб|rub|р)')
+RATING_REGEX = re.compile(r'(\d(?:[.,]\d)?)\s*[/]?\s*5')
+DELIVERY_COST_REGEX = re.compile(r'доставк[ае]\s*[: ]?\s*(\d{1,3}(?:[ \d]{0,3})?(?:[.,]\d{2})?)\s*(?:₽|руб)')
+DELIVERY_DAYS_REGEX = re.compile(r'(\d{1,3})\s*(?:дн|день|дня|дней|day|days)')
 
-# === Настройка OpenRouter ===
-client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    default_headers={
-        "HTTP-Referer": "https://t.me/p01sK0vikbot",
-        "X-Title": "SmartSearchBot"
-    }
-)
-PRIMARY_MODEL = "google/gemini-2.0-flash-exp:free"
-FALLBACK_MODEL = "openai/gpt-4o-mini"
+def extract_city(text: str) -> Optional[str]:
+    text_lower = text.lower()
+    for city in CITIES:
+        if city in text_lower:
+            return city
+    return None
 
-logger.info(f"Основная ИИ-модель: {PRIMARY_MODEL}")
-logger.info(f"Резервная ИИ-модель: {FALLBACK_MODEL}")
-logger.info("Serper API настроен")
+def is_valid_query(text: str) -> bool:
+    if len(text.strip()) < 3:
+        return False
+    if not re.search(r'[a-zA-Zа-яА-Я]', text):
+        return False
+    # Простейшая проверка на мат (можно расширить)
+    bad_words = ['хер', 'хуй', 'пизд', 'ебан', 'fuck', 'shit']
+    for bw in bad_words:
+        if bw in text.lower():
+            return False
+    return True
 
-
-# ========== УМНАЯ ЛОГИКА АГЕНТА ==========
-
-async def call_llm(prompt: str, temperature: float = 0.1, max_tokens: int = 100) -> str:
-    """Вызов LLM с автоматическим переключением на резервную модель при ошибке."""
+def parse_number(s: str) -> float:
+    s = s.replace(' ', '')
+    if ',' in s and '.' in s:
+        s = s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        s = s.replace(',', '.')
     try:
-        response = await client.chat.completions.create(
-            model=PRIMARY_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.warning(f"Ошибка при вызове {PRIMARY_MODEL}: {e}. Переключаюсь на {FALLBACK_MODEL}...")
-        try:
-            response = await client.chat.completions.create(
-                model=FALLBACK_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as fallback_e:
-            logger.error(f"Ошибка и у резервной модели: {fallback_e}")
-            raise fallback_e
+        return float(s)
+    except:
+        return 0.0
 
+def extract_product_info(snippet: Dict[str, Any]) -> Optional[Dict]:
+    content = snippet.get('content', '') or snippet.get('raw_content', '')
+    if not content:
+        return None
 
-async def text_to_search_query(user_input: str) -> str:
-    """Превращает запрос в оптимизированную поисковую фразу."""
-    prompt = f"""
-Преврати запрос пользователя в поисковую фразу для Google Shopping.
-Выдели товар, бренд, модель. Добавь "купить" или "цена".
-Верни ТОЛЬКО поисковую фразу, без кавычек и пояснений.
+    title = snippet.get('title', '')
+    url = snippet.get('url', '')
 
-Пример: "найди айфон 15 про" → iPhone 15 Pro купить цена
+    price_match = PRICE_REGEX.search(content)
+    price = parse_number(price_match.group(1)) if price_match else 0.0
 
-Запрос: "{user_input}"
-Поисковая фраза:
-"""
-    try:
-        query = await call_llm(prompt, temperature=0.1, max_tokens=100)
-        logger.info(f"Поисковый запрос: {query}")
-        return query
-    except Exception as e:
-        logger.error(f"Ошибка формирования запроса: {e}")
-        return user_input
+    rating_match = RATING_REGEX.search(content)
+    rating = parse_number(rating_match.group(1)) if rating_match else 0.0
+    if rating > 5:
+        rating = 5.0
 
+    delivery_cost_match = DELIVERY_COST_REGEX.search(content)
+    delivery_cost = parse_number(delivery_cost_match.group(1)) if delivery_cost_match else 0.0
 
-async def search_serper(query: str, num_results: int = 5) -> List[Dict[str, Any]]:
-    """Поиск через Serper.dev с оптимизацией."""
-    url = "https://google.serper.dev/search"
-    headers = {
-        "X-API-KEY": SERPER_API_KEY,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "q": query + " цена купить",
-        "gl": "ru",
-        "hl": "ru",
-        "num": num_results
-    }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers) as response:
-                data = await response.json()
-        
-        results = []
-        for item in data.get("organic", [])[:num_results]:
-            if "pinterest.com" in item.get("link", "") or "youtube.com" in item.get("link", ""):
-                continue
-                
-            results.append({
-                "title": item.get("title", "Без названия"),
-                "snippet": item.get("snippet", ""),
-                "link": item.get("link", ""),
-                "source": item.get("source", item.get("displayLink", "неизвестно")),
-                "price": item.get("price")
-            })
-        
-        logger.info(f"Serper: найдено {len(results)} результатов по запросу '{query}'")
-        return results
-        
-    except Exception as e:
-        logger.error(f"Ошибка Serper: {e}")
-        return []
+    delivery_days_match = DELIVERY_DAYS_REGEX.search(content)
+    delivery_days = int(delivery_days_match.group(1)) if delivery_days_match else 0
 
+    if price == 0 and rating == 0 and delivery_cost == 0 and delivery_days == 0:
+        return None
 
-async def analyze_results(
-    user_query: str,
-    search_query: str,
-    results: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """Анализирует результаты и возвращает топ-3 с объяснением выбора лучшего."""
-    if not results:
-        return {
-            "top_offers": [],
-            "reason": "Ничего не найдено."
-        }
-
-    results_text = ""
-    for i, r in enumerate(results, 1):
-        price_info = f" (Цена: {r['price']})" if r.get('price') else ""
-        results_text += f"""
-{i}. **{r['title']}**{price_info}
-   📝 {r['snippet'][:150]}...
-   🔗 {r['link']}
-   📦 {r['source']}
-"""
-
-    prompt = f"""
-Ты — эксперт по поиску выгодных покупок. Проанализируй результаты поиска Google.
-
-Пользователь искал: "{user_query}"
-Поисковый запрос: "{search_query}"
-
-Результаты поиска:
-{results_text}
-
-Твоя задача:
-1. Отранжируй предложения от лучшего к худшему по критерию: цена (чем ниже, тем лучше) → надёжность магазина (известные сети, официальные сайты) → релевантность.
-2. Выбери ТОП-3 лучших предложения.
-3. Для лучшего (первого) предложения напиши краткое объяснение: почему именно оно признано лучшим.
-
-Верни ответ СТРОГО в формате JSON:
-{{
-  "top_offers": [
-    {{
-      "title": "Название предложения 1",
-      "link": "Ссылка",
-      "price": "Цена или 'Не указана'",
-      "source": "Источник"
-    }},
-    {{
-      "title": "Название предложения 2",
-      "link": "Ссылка",
-      "price": "Цена или 'Не указана'",
-      "source": "Источник"
-    }},
-    {{
-      "title": "Название предложения 3",
-      "link": "Ссылка",
-      "price": "Цена или 'Не указана'",
-      "source": "Источник"
-    }}
-  ],
-  "reason": "Краткое объяснение: почему первое предложение лучшее. Например: 'Самая низкая цена (7990 руб.) среди всех предложений' или 'Официальный сайт бренда, цена не указана, но это самый надёжный источник.'"
-}}
-"""
-    try:
-        response = await call_llm(prompt, temperature=0.3, max_tokens=800)
-        
-        try:
-            json_start = response.find('{')
-            json_end = response.rfind('}') + 1
-            json_str = response[json_start:json_end]
-            analysis = json.loads(json_str)
-            logger.info(f"Анализ выполнен успешно, найдено предложений: {len(analysis.get('top_offers', []))}")
-            return analysis
-        except json.JSONDecodeError:
-            logger.warning("Не удалось распарсить JSON, использую fallback")
-            top_offers = []
-            for r in results[:3]:
-                top_offers.append({
-                    "title": r['title'],
-                    "link": r['link'],
-                    "price": r.get('price', 'Не указана'),
-                    "source": r['source']
-                })
-            return {
-                "top_offers": top_offers,
-                "reason": "Автоматический выбор: первые и наиболее релевантные предложения в выдаче Google."
-            }
-            
-    except Exception as e:
-        logger.error(f"Ошибка анализа: {e}")
-        top_offers = []
-        for r in results[:3]:
-            top_offers.append({
-                "title": r['title'],
-                "link": r['link'],
-                "price": r.get('price', 'Не указана'),
-                "source": r['source']
-            })
-        return {
-            "top_offers": top_offers,
-            "reason": "Автоматический выбор из-за технической ошибки анализа."
-        }
-
-
-async def process_user_request(user_text: str) -> str:
-    """Главная функция обработки запроса с расширенным ответом."""
-    logger.info(f"Запрос: {user_text[:50]}...")
-
-    try:
-        # 1. Формируем поисковый запрос
-        search_query = await text_to_search_query(user_text)
-
-        # 2. Ищем через Serper
-        results = await search_serper(search_query, 5)
-
-        # 3. Анализируем
-        analysis = await analyze_results(user_text, search_query, results)
-
-        # 4. Формируем красивый ответ
-        header = f"🔍 **Поисковый запрос:** `{search_query}`\n"
-        
-        offers_block = ""
-        top_offers = analysis.get('top_offers', [])
-        
-        if top_offers:
-            offers_block = "🏆 **ТОП-3 предложения:**\n\n"
-            medals = ["🥇", "🥈", "🥉"]
-            for i, offer in enumerate(top_offers):
-                medal = medals[i] if i < 3 else f"{i+1}."
-                offers_block += f"{medal} **{offer['title']}**\n"
-                offers_block += f"   💰 {offer['price']}\n"
-                offers_block += f"   📦 {offer['source']}\n"
-                offers_block += f"   🔗 {offer['link']}\n\n"
-        else:
-            offers_block = "❌ Ничего не найдено.\n"
-        
-        reason = analysis.get('reason', '')
-        reason_block = f"🧠 **Почему первое место лучшее:**\n{reason}\n" if reason else ""
-        
-        footer = f"📊 *Проанализировано результатов: {len(results)}*"
-
-        full_response = f"{header}\n{offers_block}{reason_block}{footer}"
-        
-        logger.info("Ответ сформирован")
-        return full_response
-
-    except Exception as e:
-        logger.error(f"Ошибка обработки: {e}", exc_info=True)
-        return f"⚠️ Внутренняя ошибка. Попробуй позже."
-
-
-def get_stats() -> Dict[str, str]:
     return {
-        "model": f"{PRIMARY_MODEL} (резерв: {FALLBACK_MODEL})",
-        "search": "Serper.dev (Google)",
-        "status": "active"
+        'title': title,
+        'price': price,
+        'rating': rating,
+        'delivery_cost': delivery_cost,
+        'delivery_days': delivery_days,
+        'url': url
     }
 
+def normalize_list(values: List[float]) -> List[float]:
+    if not values:
+        return []
+    min_v, max_v = min(values), max(values)
+    if max_v == min_v:
+        return [0.5] * len(values)
+    return [(max_v - v) / (max_v - min_v) for v in values]
 
-# ========== ТЕЛЕГРАМ БОТ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Я ищу товары в интернете.\n"
+        "Напиши, что хочешь найти, например: «игровой ноутбук москва»\n"
+        "Если город не укажешь — спрошу отдельно."
+    )
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
-)
-dp = Dispatcher()
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip()
+    state = context.user_data.get('state', 'new')
 
+    # --- Этап: спрашиваем город, если его нет ---
+    if state == 'new':
+        city = extract_city(user_text)
+        if city:
+            context.user_data['city'] = city
+            query = user_text
+        else:
+            context.user_data['pending_query'] = user_text
+            context.user_data['state'] = 'awaiting_city'
+            await update.message.reply_text("В каком городе ищем товар?")
+            return
+    elif state == 'awaiting_city':
+        city = extract_city(user_text) or user_text
+        context.user_data['city'] = city
+        query = context.user_data.get('pending_query', '')
+        context.user_data['state'] = 'done'
+    else:
+        query = user_text
+        city = context.user_data.get('city', '')
 
-async def set_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="🚀 Начать"),
-        BotCommand(command="help", description="❓ Помощь"),
-        BotCommand(command="stats", description="📊 Статистика"),
-    ]
-    await bot.set_my_commands(commands)
-
-
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer("""
-👋 **Привет! Я умный AI-агент для поиска товаров.**
-
-🔍 Нахожу товары по описанию
-💰 Сравниваю цены
-🎯 Выбираю ТОП-3 предложения
-🧠 Объясняю свой выбор
-
-**Примеры:**
-• `найди iphone 15 pro`
-• `робот пылесос xiaomi`
-• `утюг philips цена`
-
-Просто напиши, что хочешь найти!
-""")
-    logger.info(f"Пользователь {message.from_user.id} запустил бота")
-
-
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer("""
-❓ **Как пользоваться**
-
-1️⃣ Напиши, что хочешь найти
-2️⃣ Я найду результаты через Google
-3️⃣ Проанализирую с помощью ИИ
-4️⃣ Пришлю ТОП-3 предложения и объясню выбор лучшего
-
-**Советы:**
-• Указывай бренд и модель
-• Добавляй "цена" или "купить"
-
-*Время ответа: 5-10 секунд*
-""")
-
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    stats = get_stats()
-    await message.answer(f"""
-📊 **Статистика**
-
-🔧 Модель: `{stats['model']}`
-🌐 Поиск: `{stats['search']}`
-✅ Статус: `{stats['status']}`
-""")
-
-
-@dp.message()
-async def handle_text(message: Message):
-    user_text = message.text.strip()
-
-    if len(user_text) < 3:
-        await message.answer("⚠️ Слишком коротко. Напиши, что искать.")
+    # --- Валидация запроса ---
+    if not is_valid_query(query):
+        await update.message.reply_text(
+            "❌ Запрос слишком короткий, содержит неприемлемые слова или не похож на поиск товара.\n"
+            "Пожалуйста, перефразируйте."
+        )
         return
 
-    await bot.send_chat_action(message.chat.id, action="typing")
-    status_msg = await message.answer("🔍 *Ищу информацию...*")
+    city = context.user_data.get('city', '')
+    search_query = f"{query} цена рейтинг доставка {city}" if city else query
 
+    # --- Поиск через Tavily ---
     try:
-        response = await process_user_request(user_text)
-        await status_msg.edit_text(
-            response,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=False
-        )
+        client = TavilyClient(api_key=TAVILY_API_KEY)
+        results = client.search(search_query, max_results=8)
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await status_msg.edit_text("❌ Ошибка. Попробуй позже.")
+        logger.error(f"Tavily error: {e}")
+        await update.message.reply_text("Ошибка при поиске. Проверьте ключ Tavily.")
+        return
 
+    # --- Извлекаем данные ---
+    products_raw = []
+    for item in results.get('results', []):
+        info = extract_product_info(item)
+        if info:
+            products_raw.append(info)
 
-# ========== ЗАПУСК ==========
+    if not products_raw:
+        await update.message.reply_text("Не удалось найти товары с достаточной информацией.")
+        return
 
-async def main():
-    logger.info("Запуск продвинутого бота...")
-    await set_commands(bot)
-    try:
-        logger.info("Бот запущен!")
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-    finally:
-        await bot.session.close()
+    # --- Нормализация и расчёт баллов ---
+    prices = [p['price'] for p in products_raw]
+    ratings = [p['rating'] / 5 for p in products_raw]
+    delivery_costs = [p['delivery_cost'] for p in products_raw]
+    delivery_days = [p['delivery_days'] for p in products_raw]
 
+    norm_prices = normalize_list(prices)
+    norm_ratings = normalize_list(ratings)  # нормализация рейтинга в 0-1 (чем выше, тем лучше)
+    norm_costs = normalize_list(delivery_costs)
+    norm_days = normalize_list(delivery_days)
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
-    except Exception as e:
-        logger.error(f"Ошибка запуска: {e}")
+    for i, prod in enumerate(products_raw):
+        score = (0.4 * norm_prices[i] +
+                 0.3 * norm_ratings[i] +
+                 0.15 * norm_costs[i] +
+                 0.15 * norm_days[i])
+        prod['score'] = score
+
+    # Сортировка и топ-3
+    products_raw.sort(key=lambda x: x['score'], reverse=True)
+    top3 = products_raw[:3]
+
+    # --- Формируем ответ ---
+    answer = "🔍 **ТОП-3 товаров**\n\n"
+    for idx, prod in enumerate(top3, 1):
+        medal = "🥇" if idx == 1 else ("🥈" if idx == 2 else "🥉")
+        answer += f"{medal} **{prod['title']}**\n"
+        answer += f"💰 Цена: {prod['price']:.2f} ₽\n"
+        answer += f"⭐ Рейтинг: {prod['rating']:.1f}/5\n"
+        answer += f"📦 Доставка: {prod['delivery_cost']:.2f} ₽, {prod['delivery_days']} дн.\n"
+        answer += f"📊 Балл: {prod['score']:.2f}\n"
+        answer += f"[Ссылка]({prod['url']})\n\n"
+
+    # Обоснование для первого места
+    if top3:
+        best = top3[0]
+        reasons = []
+        if best['score'] > 0.7:
+            reasons.append("высокий рейтинг")
+        if best['price'] < min(p['price'] for p in products_raw):
+            reasons.append("самая низкая цена")
+        if best['delivery_days'] < min(p['delivery_days'] for p in products_raw):
+            reasons.append("быстрая доставка")
+        if not reasons:
+            reasons.append("сбалансированные характеристики")
+        answer += f"\n💡 **Почему первый товар лучший?** {', '.join(reasons)}."
+
+    await update.message.reply_text(answer, parse_mode='Markdown')
+
+    # Сброс состояния
+    context.user_data.clear()
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Бот запущен. Нажми Ctrl+C для остановки.")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
