@@ -11,14 +11,13 @@ from telegram.ext import (
     filters,
 )
 from tavily import TavilyClient
+import os
 
-# -------------------------------------------------------------------
-# НАСТРОЙКИ - ЗАМЕНИ НА СВОИ ТОКЕНЫ
-# -------------------------------------------------------------------
-TELEGRAM_TOKEN
-TAVILY_API_KEY
-# -------------------------------------------------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
+if not TELEGRAM_TOKEN or not TAVILY_API_KEY:
+    raise ValueError("Не заданы переменные окружения TELEGRAM_TOKEN и TAVILY_API_KEY")
 # Логирование
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
