@@ -15,8 +15,8 @@ from tavily import TavilyClient
 # -------------------------------------------------------------------
 # НАСТРОЙКИ - ЗАМЕНИ НА СВОИ ТОКЕНЫ
 # -------------------------------------------------------------------
-TELEGRAM_TOKEN = "8795896150:AAFfyPQ8YCIJ7qvxdvHjQBwQoNxh7sCq4ss"   # Вставь сюда токен от @BotFather
-TAVILY_API_KEY = "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"       # Вставь сюда API-ключ Tavily (получить на tavily.com)
+TELEGRAM_TOKEN
+TAVILY_API_KEY
 # -------------------------------------------------------------------
 
 # Логирование
