@@ -23,60 +23,52 @@ if not TELEGRAM_TOKEN or not TAVILY_API_KEY:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MIN_PRICE = 500  # минимальная цена для фильтрации совсем мусора
+# Минимальные цены по категориям
+GPU_MIN_PRICE = 15000
+CPU_MIN_PRICE = 5000
+DEFAULT_MIN_PRICE = 2000
 
-# Список городов
 CITIES = {
     "москва", "мск", "санкт-петербург", "спб", "новосибирск", "екатеринбург",
     "казань", "нижний новгород", "челябинск", "омск", "самара", "ростов-на-дону",
     "уфа", "красноярск", "пермь", "воронеж", "волгоград", "краснодар"
 }
 
-# Белый список доменов магазинов (можно расширять)
 ALLOWED_DOMAINS = [
     "ozon.ru", "wildberries.ru", "market.yandex.ru", "citilink.ru", "dns-shop.ru",
     "mvideo.ru", "eldorado.ru", "technopark.ru", "onlinetrade.ru", "regard.ru",
-    "xcom-shop.ru", "computeruniverse.ru", "pcshop.ru", "compyou.ru",
-    "megamarket.ru", "holodilnik.ru", "re-store.ru", "nix.ru", "knsneva.ru",
-    "avito.ru", "goods.ru", "tehnosila.ru", "electrozone.ru", "ultracomp.ru"
+    "xcom-shop.ru", "pcshop.ru", "compyou.ru", "megamarket.ru", "re-store.ru",
+    "nix.ru", "knsneva.ru", "avito.ru", "goods.ru", "tehnosila.ru"
 ]
 
-# Слова-паразиты, которые удаляем при извлечении модели
+# Паттерны URL, указывающие на страницу товара (не категорию, не поиск)
+PRODUCT_URL_PATTERNS = [
+    r'/product/', r'/item/', r'/p/', r'/goods/', r'/card/', r'/offer/',
+    r'/show/', r'/catalog/.*/product/', r'/tovar/', r'/model/', r'/sku/',
+    r'/\d+\.html', r'/\d+/', r'/dp/', r'/gp/'
+]
+
 STOP_WORDS = [
-    "материнская плата", "мат плата", "материнка", "мать", "motherboard",
+    "материнская плата", "мат плата", "материнка", "motherboard",
     "купить", "цена", "стоимость", "доставка", "в", "на", "для", "с", "и", "за",
     "процессор", "видеокарта", "оперативная память", "ssd", "блок питания",
-    "материнскую", "плату", "лучший", "топ", "дешево"
+    "лучший", "топ", "дешево"
 ]
 
-def extract_keywords(text: str, city: str = None) -> str:
-    """Извлекает ключевые слова товара (модель), убирая город и стоп-слова."""
-    query = text.lower()
-    if city:
-        query = re.sub(r'\b' + re.escape(city.lower()) + r'\b', '', query)
-    for word in STOP_WORDS:
-        query = re.sub(r'\b' + re.escape(word) + r'\b', '', query, flags=re.IGNORECASE)
-    # Убираем лишние символы и пробелы
-    query = re.sub(r'[^\w\s]', '', query)
-    query = re.sub(r'\s+', ' ', query).strip()
-    # Если после чистки осталось пусто, возвращаем исходный запрос (хотя бы что-то)
-    return query if query else text.lower()
-
-def is_relevant(product_title: str, keywords: str) -> bool:
-    """Проверяет, содержит ли название товара основные ключевые слова модели."""
-    if not keywords:
+def is_product_url(url: str) -> bool:
+    url_lower = url.lower()
+    # Проверяем паттерны
+    for pattern in PRODUCT_URL_PATTERNS:
+        if re.search(pattern, url_lower):
+            return True
+    # Если URL содержит цифры (ID товара) и нет признаков категории
+    if re.search(r'/\d+', url_lower) and not re.search(r'/category/|/catalog/|/search|\?', url_lower):
         return True
-    title_lower = product_title.lower()
-    keyword_parts = keywords.split()
-    # Для коротких запросов (1-2 слова) достаточно одного совпадения
-    if len(keyword_parts) <= 2:
-        return any(part in title_lower for part in keyword_parts)
-    else:
-        # Для длинных – хотя бы половина слов должна быть
-        matched = sum(1 for part in keyword_parts if part in title_lower)
-        return matched >= len(keyword_parts) // 2
+    return False
 
 def is_allowed_url(url: str) -> bool:
+    if not is_product_url(url):
+        return False
     return any(domain in url.lower() for domain in ALLOWED_DOMAINS)
 
 def extract_city(text: str) -> Optional[str]:
@@ -86,26 +78,60 @@ def extract_city(text: str) -> Optional[str]:
             return city
     return None
 
-def parse_price(s: str) -> float:
-    s = s.replace(' ', '').replace(',', '.')
+def extract_keywords(text: str, city: str = None) -> str:
+    query = text.lower()
+    if city:
+        query = re.sub(r'\b' + re.escape(city.lower()) + r'\b', '', query)
+    for word in STOP_WORDS:
+        query = re.sub(r'\b' + re.escape(word) + r'\b', '', query, flags=re.IGNORECASE)
+    query = re.sub(r'[^\w\s]', '', query)
+    query = re.sub(r'\s+', ' ', query).strip()
+    return query if query else text.lower()
+
+def detect_product_type(query: str) -> str:
+    q = query.lower()
+    if 'видеокарт' in q or 'rtx' in q or 'gpu' in q or 'gtx' in q:
+        return 'gpu'
+    if 'процессор' in q or 'cpu' in q:
+        return 'cpu'
+    return 'other'
+
+def parse_price(price_str: str, product_type: str) -> float:
+    price_str = price_str.replace(' ', '').replace(',', '.')
     try:
-        price = float(s)
-        if price < MIN_PRICE:
+        price = float(price_str)
+        if price <= 0:
+            return 0.0
+        if product_type == 'gpu' and price < GPU_MIN_PRICE:
+            return 0.0
+        if product_type == 'cpu' and price < CPU_MIN_PRICE:
+            return 0.0
+        if product_type == 'other' and price < DEFAULT_MIN_PRICE:
             return 0.0
         return price
     except:
         return 0.0
 
 def extract_availability(content: str) -> str:
-    """Определяет статус наличия товара."""
-    content_lower = content.lower()
-    if "нет в наличии" in content_lower or "ожидается" in content_lower or "под заказ" in content_lower:
+    c = content.lower()
+    if any(phrase in c for phrase in ['нет в наличии', 'ожидается', 'под заказ', 'распродано', 'заканчивается', 'предзаказ']):
         return "❌ Нет в наличии"
-    if "в наличии" in content_lower:
+    if 'в наличии' in c:
         return "✅ В наличии"
     return "❔ Наличие не указано"
 
-def extract_product_info(snippet: Dict[str, Any], keywords: str) -> Optional[Dict]:
+def is_relevant(title: str, keywords: str) -> bool:
+    if not keywords:
+        return True
+    title_lower = title.lower()
+    parts = keywords.split()
+    if len(parts) <= 2:
+        return any(p in title_lower for p in parts)
+    else:
+        matched = sum(1 for p in parts if p in title_lower)
+        return matched >= len(parts) // 2
+
+def extract_product_info(snippet: Dict[str, Any], keywords: str, product_type: str) -> Optional[Dict]:
     url = snippet.get('url', '')
     if not is_allowed_url(url):
         return None
@@ -115,35 +141,38 @@ def extract_product_info(snippet: Dict[str, Any], keywords: str) -> Optional[Dic
         return None
 
     title = snippet.get('title', '')
-
-    # Фильтрация по ключевым словам модели
     if keywords and not is_relevant(title, keywords):
         return None
 
     # Цена
     price_match = re.search(r'(\d{1,3}(?:[ \d]{0,3})?(?:[.,]\d{2})?)\s*(?:₽|руб|р|RUB)', content, re.IGNORECASE)
-    price = parse_price(price_match.group(1)) if price_match else 0.0
-    # Если цена не найдена – все равно показываем, но с пометкой
-    price_str = f"{price:.0f} ₽" if price > 0 else "❓ Цена не указана"
+    price = 0.0
+    price_str = "❓ Цена не указана"
+    if price_match:
+        price = parse_price(price_match.group(1), product_type)
+        if price > 0:
+            price_str = f"{price:.0f} ₽"
 
-    # Рейтинг (если есть)
+    # Рейтинг
+    rating_str = "нет рейтинга"
     rating_match = re.search(r'(\d(?:[.,]\d)?)\s*[/]?\s*5', content)
-    rating = float(rating_match.group(1).replace(',', '.')) if rating_match else 0.0
-    rating = min(rating, 5.0)
-    rating_str = f"{rating:.1f}/5" if rating > 0 else "нет рейтинга"
+    if rating_match:
+        rating = float(rating_match.group(1).replace(',', '.'))
+        rating = min(rating, 5.0)
+        if rating > 0:
+            rating_str = f"{rating:.1f}/5"
 
     # Доставка
-    delivery_cost = 0.0
     delivery_cost_str = "❓ не указана"
     delivery_days_str = "❓ не указан"
-    delivery_text = re.search(r'доставк[ае][:]*\s*([\d\s.,]+)\s*(?:₽|руб|р)?', content, re.IGNORECASE)
-    if delivery_text:
-        cost_str = re.sub(r'[^\d.,]', '', delivery_text.group(1))
-        if cost_str:
-            delivery_cost = parse_price(cost_str)
-            if delivery_cost > 0:
-                delivery_cost_str = f"{delivery_cost:.0f} ₽"
-            elif delivery_cost == 0:
+    deliv_match = re.search(r'доставк[ае][:]*\s*(\d[\d\s.,]*)\s*(?:₽|руб|р)?', content, re.IGNORECASE)
+    if deliv_match:
+        cost_clean = re.sub(r'[^\d.,]', '', deliv_match.group(1))
+        if cost_clean:
+            cost = parse_price(cost_clean, 'other')
+            if cost > 0:
+                delivery_cost_str = f"{cost:.0f} ₽"
+            elif cost == 0:
                 delivery_cost_str = "бесплатно"
     if 'бесплатно' in content.lower() and delivery_cost_str == "❓ не указана":
         delivery_cost_str = "бесплатно"
@@ -163,7 +192,7 @@ def extract_product_info(snippet: Dict[str, Any], keywords: str) -> Optional[Dic
         'delivery_days_str': delivery_days_str,
         'availability': availability,
         'url': url,
-        'score': 0.0  # будет заполнено позже
+        'score': 0.0
     }
 
 def normalize_list(values: List[float]) -> List[float]:
@@ -174,23 +203,21 @@ def normalize_list(values: List[float]) -> List[float]:
         return [0.5] * len(values)
     return [(mx - v) / (mx - mn) for v in values]
 
-def generate_justification(best: Dict, products: List[Dict]) -> str:
+def generate_justification(best: Dict, all_products: List[Dict]) -> str:
     reasons = []
-    # Сравниваем только те товары, у которых есть цена
-    priced_products = [p for p in products if p['price'] > 0]
-    if priced_products and best.get('price', 0) > 0:
-        prices = [p['price'] for p in priced_products]
+    priced = [p for p in all_products if p['price'] > 0]
+    if priced and best['price'] > 0:
+        prices = [p['price'] for p in priced]
         if best['price'] == min(prices):
             reasons.append("✅ самая низкая цена")
         else:
             diff = best['price'] - min(prices)
             reasons.append(f"💰 цена всего на {diff:.0f} ₽ выше минимальной")
-    if best.get('availability') == "✅ В наличии":
+    if best['availability'] == "✅ В наличии":
         reasons.append("📦 есть в наличии")
-    if "бесплатно" in best.get('delivery_cost_str', ''):
+    if "бесплатно" in best['delivery_cost_str']:
         reasons.append("🚚 бесплатная доставка")
-    # про рейтинг добавим только если он есть
-    if best.get('rating_str') and best['rating_str'] != "нет рейтинга":
+    if best['rating_str'] != "нет рейтинга":
         reasons.append(f"⭐ рейтинг {best['rating_str']}")
     if not reasons:
         reasons.append("сбалансированные характеристики")
@@ -247,45 +274,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🌆 В каком городе ищем? Напиши название (Москва, Казань и т.д.)")
 
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, full_query: str, city: str):
-    # Извлекаем ключевые слова модели
     keywords = extract_keywords(full_query, city)
+    product_type = detect_product_type(full_query)
     search_query = f"{keywords} {city} купить" if keywords else f"{full_query} {city} купить"
-    logger.info(f"Search query: {search_query} | Keywords: {keywords}")
+    logger.info(f"Search: {search_query} | Keywords: {keywords} | Type: {product_type}")
 
     try:
         client = TavilyClient(api_key=TAVILY_API_KEY)
-        # Сначала пробуем искать с ограничением по магазинам
         site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:10]])
         results = client.search(f"{search_query} ({site_query})", max_results=30, search_depth="advanced")
         if len(results.get('results', [])) < 3:
-            # Если мало результатов, ищем без site:
             results = client.search(search_query, max_results=30, search_depth="advanced")
     except Exception as e:
         logger.error(f"Tavily error: {e}")
         await update.message.reply_text("❌ Ошибка при поиске. Попробуйте позже.")
         return
 
-    # Извлекаем информацию о товарах
     products = []
     for item in results.get('results', []):
-        info = extract_product_info(item, keywords)
+        info = extract_product_info(item, keywords, product_type)
         if info:
             products.append(info)
 
     if not products:
-        await update.message.reply_text("😕 Не удалось найти товары по вашему запросу. Попробуйте изменить модель или город.")
+        await update.message.reply_text("😕 Не удалось найти подходящие товары. Попробуйте изменить запрос или город.")
         return
 
-    # Сортировка по баллу (учитываем только цену и наличие)
-    for p in products:
-        # Балл: учитываем цену (чем ниже, тем лучше) и наличие (в наличии + балл)
-        price_norm = 0.0
-        if p['price'] > 0:
-            # временно для сортировки – позже пересчитаем нормализованно
-            p['temp_price'] = p['price']
-        else:
-            p['temp_price'] = 1e9  # большая цена, чтобы уходил вниз
-    # Нормализуем цены среди тех, у кого цена >0
+    # Нормализация цен
     prices = [p['price'] for p in products if p['price'] > 0]
     norm_prices = normalize_list(prices) if prices else []
     price_idx = 0
@@ -295,14 +310,12 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
             price_idx += 1
         else:
             p['norm_price'] = 0.0
-        # Бонус за наличие
         availability_bonus = 0.3 if p['availability'] == "✅ В наличии" else 0.0
         p['score'] = p['norm_price'] + availability_bonus
 
     products.sort(key=lambda x: x['score'], reverse=True)
     top3 = products[:3]
 
-    # Формируем ответ
     answer = f"🔍 **Результаты для «{full_query}»** (город: {city})\n\n"
     for idx, p in enumerate(top3, 1):
         if idx == 1:
@@ -327,7 +340,7 @@ def main():
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Бот запущен и готов к работе.")
+    print("Бот запущен.")
     app.run_polling()
 
 if __name__ == '__main__':
