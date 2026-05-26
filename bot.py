@@ -23,7 +23,7 @@ if not TELEGRAM_TOKEN or not TAVILY_API_KEY:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Минимальные цены по категориям
+# Минимальные реальные цены
 GPU_MIN_PRICE = 15000
 CPU_MIN_PRICE = 5000
 DEFAULT_MIN_PRICE = 2000
@@ -35,41 +35,27 @@ CITIES = {
 }
 
 ALLOWED_DOMAINS = [
-    "ozon.ru", "wildberries.ru", "market.yandex.ru", "citilink.ru", "dns-shop.ru",
-    "mvideo.ru", "eldorado.ru", "technopark.ru", "onlinetrade.ru", "regard.ru",
-    "xcom-shop.ru", "pcshop.ru", "compyou.ru", "megamarket.ru", "re-store.ru",
-    "nix.ru", "knsneva.ru", "avito.ru", "goods.ru", "tehnosila.ru"
+    "dns-shop.ru", "citilink.ru", "mvideo.ru", "eldorado.ru", "technopark.ru",
+    "ozon.ru", "wildberries.ru", "market.yandex.ru", "megamarket.ru", "regard.ru",
+    "onlinetrade.ru", "xcom-shop.ru", "pcshop.ru", "compyou.ru", "nix.ru"
 ]
 
-# Паттерны URL, указывающие на страницу товара (не категорию, не поиск)
+# Паттерны товарных URL
 PRODUCT_URL_PATTERNS = [
     r'/product/', r'/item/', r'/p/', r'/goods/', r'/card/', r'/offer/',
     r'/show/', r'/catalog/.*/product/', r'/tovar/', r'/model/', r'/sku/',
     r'/\d+\.html', r'/\d+/', r'/dp/', r'/gp/'
 ]
 
-STOP_WORDS = [
-    "материнская плата", "мат плата", "материнка", "motherboard",
-    "купить", "цена", "стоимость", "доставка", "в", "на", "для", "с", "и", "за",
-    "процессор", "видеокарта", "оперативная память", "ssd", "блок питания",
-    "лучший", "топ", "дешево"
-]
-
 def is_product_url(url: str) -> bool:
     url_lower = url.lower()
-    # Проверяем паттерны
     for pattern in PRODUCT_URL_PATTERNS:
         if re.search(pattern, url_lower):
             return True
-    # Если URL содержит цифры (ID товара) и нет признаков категории
-    if re.search(r'/\d+', url_lower) and not re.search(r'/category/|/catalog/|/search|\?', url_lower):
-        return True
     return False
 
 def is_allowed_url(url: str) -> bool:
-    if not is_product_url(url):
-        return False
-    return any(domain in url.lower() for domain in ALLOWED_DOMAINS)
+    return is_product_url(url) and any(domain in url.lower() for domain in ALLOWED_DOMAINS)
 
 def extract_city(text: str) -> Optional[str]:
     text_lower = text.lower()
@@ -82,15 +68,17 @@ def extract_keywords(text: str, city: str = None) -> str:
     query = text.lower()
     if city:
         query = re.sub(r'\b' + re.escape(city.lower()) + r'\b', '', query)
-    for word in STOP_WORDS:
-        query = re.sub(r'\b' + re.escape(word) + r'\b', '', query, flags=re.IGNORECASE)
+    # удаляем стоп-слова
+    stop_words = ["материнская плата", "мат плата", "материнка", "купить", "цена", "доставка", "в", "на", "для", "с", "и", "за"]
+    for w in stop_words:
+        query = re.sub(r'\b' + re.escape(w) + r'\b', '', query, flags=re.IGNORECASE)
     query = re.sub(r'[^\w\s]', '', query)
     query = re.sub(r'\s+', ' ', query).strip()
     return query if query else text.lower()
 
 def detect_product_type(query: str) -> str:
     q = query.lower()
-    if 'видеокарт' in q or 'rtx' in q or 'gpu' in q or 'gtx' in q:
+    if 'видеокарт' in q or 'rtx' in q or 'gpu' in q:
         return 'gpu'
     if 'процессор' in q or 'cpu' in q:
         return 'cpu'
@@ -144,7 +132,7 @@ def extract_product_info(snippet: Dict[str, Any], keywords: str, product_type: s
     if keywords and not is_relevant(title, keywords):
         return None
 
-    # Цена
+    # Усиленный поиск цены: ищем любую цифру с валютой
     price_match = re.search(r'(\d{1,3}(?:[ \d]{0,3})?(?:[.,]\d{2})?)\s*(?:₽|руб|р|RUB)', content, re.IGNORECASE)
     price = 0.0
     price_str = "❓ Цена не указана"
@@ -153,7 +141,7 @@ def extract_product_info(snippet: Dict[str, Any], keywords: str, product_type: s
         if price > 0:
             price_str = f"{price:.0f} ₽"
 
-    # Рейтинг
+    # Рейтинг (если есть)
     rating_str = "нет рейтинга"
     rating_match = re.search(r'(\d(?:[.,]\d)?)\s*[/]?\s*5', content)
     if rating_match:
@@ -162,12 +150,12 @@ def extract_product_info(snippet: Dict[str, Any], keywords: str, product_type: s
         if rating > 0:
             rating_str = f"{rating:.1f}/5"
 
-    # Доставка
+    # Доставка (стоимость и срок)
     delivery_cost_str = "❓ не указана"
     delivery_days_str = "❓ не указан"
-    deliv_match = re.search(r'доставк[ае][:]*\s*(\d[\d\s.,]*)\s*(?:₽|руб|р)?', content, re.IGNORECASE)
-    if deliv_match:
-        cost_clean = re.sub(r'[^\d.,]', '', deliv_match.group(1))
+    deliv_cost_match = re.search(r'доставк[ае][:]*\s*(\d[\d\s.,]*)\s*(?:₽|руб|р)?', content, re.IGNORECASE)
+    if deliv_cost_match:
+        cost_clean = re.sub(r'[^\d.,]', '', deliv_cost_match.group(1))
         if cost_clean:
             cost = parse_price(cost_clean, 'other')
             if cost > 0:
@@ -226,12 +214,11 @@ def generate_justification(best: Dict, all_products: List[Dict]) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛒 **Помощник по поиску комплектующих**\n\n"
-        "Я ищу процессоры, видеокарты, материнские платы и другие компоненты.\n"
-        "Просто напиши запрос, например:\n"
-        "`материнская плата asus prime z370 казань`\n"
-        "`rtx 3060 москва`\n\n"
+        "Напиши запрос с городом, например:\n"
+        "`rtx 3060 москва`\n"
+        "`материнская плата asus prime z370 казань`\n\n"
         "Если город не укажешь — спрошу отдельно.\n"
-        "Показываю ТОП-3 с ценами, наличием, доставкой и ссылками.\n\n"
+        "Я покажу карточки товаров с реальных магазинов.\n\n"
         "Команды: /help, /start",
         parse_mode='Markdown'
     )
@@ -239,12 +226,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔍 **Как я работаю**\n"
-        "1. Ты отправляешь запрос: `модель город`\n"
-        "2. Я ищу на популярных маркетплейсах РФ.\n"
-        "3. Показываю реальное наличие, цену, стоимость и срок доставки.\n"
-        "4. Первый товар – с подробным обоснованием, остальные – кратко со ссылками.\n"
-        "5. Если какой-то информации нет – пишу «не указано».\n\n"
-        "Просто отправь новый запрос, чтобы продолжить."
+        "1. Отправь запрос: `модель город`\n"
+        "2. Я ищу страницы товаров на DNS, Citilink, Ozon и других.\n"
+        "3. Извлекаю цену, рейтинг, доставку и наличие из короткого описания.\n"
+        "4. Если данных нет — пишу «не указано».\n"
+        "5. Показываю ТОП-3, где первый товар — с обоснованием.\n\n"
+        "Просто отправь новый запрос после ответа."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,7 +264,7 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
     keywords = extract_keywords(full_query, city)
     product_type = detect_product_type(full_query)
     search_query = f"{keywords} {city} купить" if keywords else f"{full_query} {city} купить"
-    logger.info(f"Search: {search_query} | Keywords: {keywords} | Type: {product_type}")
+    logger.info(f"Search: {search_query} | Keywords: {keywords}")
 
     try:
         client = TavilyClient(api_key=TAVILY_API_KEY)
@@ -300,7 +287,7 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
         await update.message.reply_text("😕 Не удалось найти подходящие товары. Попробуйте изменить запрос или город.")
         return
 
-    # Нормализация цен
+    # Нормализация цен (только если есть цена)
     prices = [p['price'] for p in products if p['price'] > 0]
     norm_prices = normalize_list(prices) if prices else []
     price_idx = 0
@@ -331,7 +318,7 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
             medal = "🥈" if idx == 2 else "🥉"
             answer += f"{medal} **{p['title'][:60]}** — Цена: {p['price_str']}, Доставка: {p['delivery_cost_str']} / {p['delivery_days_str']}, Наличие: {p['availability']}\n[Ссылка]({p['url']})\n\n"
 
-    answer += "ℹ️ Информация о ценах и доставке может быть примерной. Уточняйте на сайте магазина."
+    answer += "ℹ️ Информация о ценах и доставке может быть примерной. Уточняйте на сайте."
     await update.message.reply_text(answer, parse_mode='Markdown')
     await update.message.reply_text("✅ Готово! Отправьте новый запрос.")
 
