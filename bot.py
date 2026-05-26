@@ -1,12 +1,12 @@
 import re
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 load_dotenv()
-from telegram import Update
-from telegram.constants import ChatAction  # правильный импорт ChatAction
+from telegram import Update, constants
 from telegram.ext import (
     ApplicationBuilder,
+    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -24,21 +24,17 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 MIN_PRICE = 2000
-
 CITIES = {
     "москва", "мск", "санкт-петербург", "спб", "новосибирск", "екатеринбург",
     "казань", "нижний новгород", "челябинск", "омск", "самара", "ростов-на-дону",
-    "уфа", "красноярск", "пермь", "воронеж", "волгоград", "краснодар",
-    "киров", "тула", "ярославль", "иркутск", "хабаровск", "владивосток"
+    "уфа", "красноярск", "пермь", "воронеж", "волгоград", "краснодар"
 }
 
-# Расширенный список доменов магазинов (федеральные + региональные)
 ALLOWED_DOMAINS = [
-    "ozon.ru", "wildberries.ru", "megamarket.ru", "market.yandex.ru",
-    "dns-shop.ru", "citilink.ru", "mvideo.ru", "eldorado.ru", "technopark.ru",
-    "onlinetrade.ru", "regard.ru", "xcom-shop.ru", "computeruniverse.ru",
-    "pcshop.ru", "compyou.ru", "nix.ru", "re-store.ru", "holodilnik.ru",
-    "knsneva.ru", "technopoint.ru", "ulmart.ru", "avito.ru"
+    "ozon.ru", "wildberries.ru", "market.yandex.ru", "citilink.ru", "dns-shop.ru",
+    "mvideo.ru", "eldorado.ru", "technopark.ru", "onlinetrade.ru", "regard.ru",
+    "xcom-shop.ru", "computeruniverse.ru", "pcshop.ru", "compyou.ru",
+    "megamarket.ru", "holodilnik.ru", "re-store.ru", "nix.ru", "knsneva.ru"
 ]
 
 def is_allowed_url(url: str) -> bool:
@@ -52,7 +48,6 @@ def extract_city(text: str) -> Optional[str]:
     return None
 
 def extract_product_query(text: str, city: str = None) -> str:
-    """Оставляет только ключевые слова товара (модель), убирая город и лишние слова."""
     query = text
     if city:
         query = re.sub(r'\b' + re.escape(city) + r'\b', '', query, flags=re.IGNORECASE)
@@ -68,6 +63,15 @@ def parse_price(s: str) -> float:
     except:
         return 0.0
 
+def is_out_of_stock(content: str) -> bool:
+    """Проверяет, есть ли признаки отсутствия товара."""
+    out_of_stock_phrases = [
+        "нет в наличии", "ожидается", "поставка", "заканчивается", "товар закончился",
+        "недоступен", "предзаказ", "нет на складе", "out of stock", "под заказ"
+    ]
+    content_lower = content.lower()
+    return any(phrase in content_lower for phrase in out_of_stock_phrases)
+
 def extract_product_info(snippet: Dict[str, Any]) -> Optional[Dict]:
     url = snippet.get('url', '')
     if not is_allowed_url(url):
@@ -75,6 +79,11 @@ def extract_product_info(snippet: Dict[str, Any]) -> Optional[Dict]:
     content = snippet.get('content', '') or snippet.get('raw_content', '')
     if not content:
         return None
+
+    # Пропускаем товары, которых нет в наличии
+    if is_out_of_stock(content):
+        return None
+
     title = snippet.get('title', '')
 
     price_match = re.search(r'(\d{1,3}(?:[ \d]{0,3})?(?:[.,]\d{2})?)\s*(?:₽|руб|р|RUB)', content, re.IGNORECASE)
@@ -109,7 +118,7 @@ def extract_product_info(snippet: Dict[str, Any]) -> Optional[Dict]:
         'url': url
     }
 
-def normalize_list(values):
+def normalize_list(values: List[float]) -> List[float]:
     if not values:
         return []
     mn, mx = min(values), max(values)
@@ -117,7 +126,7 @@ def normalize_list(values):
         return [0.5] * len(values)
     return [(mx - v) / (mx - mn) for v in values]
 
-def generate_justification(best, products):
+def generate_justification(best: Dict, products: List[Dict]) -> str:
     reasons = []
     prices = [p['price'] for p in products]
     if best['price'] == min(prices):
@@ -141,6 +150,30 @@ def generate_justification(best, products):
         reasons.append("сбалансированные характеристики")
     return "📌 " + ". ".join(reasons)
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛒 **Помощник по поиску товаров для ПК и электроники**\n\n"
+        "Просто напиши, что хочешь найти, например:\n"
+        "`материнская плата asus prime z370 казань`\n"
+        "`iphone 15 pro москва`\n\n"
+        "Если город не укажешь — спрошу отдельно.\n"
+        "Я покажу ТОП-3 товара с ценами, рейтингом и доставкой.\n\n"
+        "Команды: /help, /start",
+        parse_mode='Markdown'
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔍 **Как я работаю**\n"
+        "1. Отправь запрос: `товар город` (например, `видеокарта москва`)\n"
+        "2. Если города нет — я спрошу.\n"
+        "3. Ищу только в проверенных магазинах РФ (Ozon, Яндекс.Маркет, DNS и др.)\n"
+        "4. Пропускаю товары, которых нет в наличии.\n"
+        "5. Рассчитываю балл: низкая цена, высокий рейтинг, быстрая/дешёвая доставка.\n"
+        "6. Выдаю ТОП-3: первый — подробно, остальные — кратко, но со ссылками.\n\n"
+        "Просто напиши новый запрос, чтобы продолжить."
+    )
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     state = context.user_data.get('state', '')
@@ -151,7 +184,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['city'] = city
         query = pending_query
         context.user_data.clear()
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await update.message.chat.send_action(constants.ChatAction.TYPING)
         await update.message.reply_text("🔍 Ищу товары...")
         await perform_search(update, context, query, city)
         return
@@ -159,7 +192,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city = extract_city(user_text)
     if city:
         context.user_data.clear()
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await update.message.chat.send_action(constants.ChatAction.TYPING)
         await update.message.reply_text("🔍 Ищу товары...")
         await perform_search(update, context, user_text, city)
     else:
@@ -174,10 +207,10 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
 
     try:
         client = TavilyClient(api_key=TAVILY_API_KEY)
-        site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:10]])
-        results = client.search(f"{search_query} ({site_query})", max_results=20, search_depth="advanced")
+        site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:8]])
+        results = client.search(f"{search_query} ({site_query})", max_results=25, search_depth="advanced")
         if len(results.get('results', [])) < 3:
-            results = client.search(search_query, max_results=20, search_depth="advanced")
+            results = client.search(search_query, max_results=25, search_depth="advanced")
     except Exception as e:
         logger.error(f"Tavily error: {e}")
         await update.message.reply_text("❌ Ошибка при поиске. Попробуй позже.")
@@ -190,9 +223,10 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
             products.append(info)
 
     if not products:
-        await update.message.reply_text("😕 Не нашёл товары в магазинах. Попробуй изменить запрос или город.")
+        await update.message.reply_text("😕 Не нашёл товары в наличии в магазинах. Попробуй изменить запрос или город.")
         return
 
+    # Нормализация и рейтинг
     prices = [p['price'] for p in products]
     ratings = [p['rating']/5 for p in products]
     costs = [p['delivery_cost'] for p in products]
@@ -209,28 +243,36 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
     products.sort(key=lambda x: x['score'], reverse=True)
     top3 = products[:3]
 
+    # Формируем ответ: первый подробно, остальные кратко
     answer = f"🔍 **Результаты для «{full_query}»** (город: {city})\n\n"
-    for idx, p in enumerate(top3, 1):
-        medal = "🥇" if idx == 1 else ("🥈" if idx == 2 else "🥉")
-        answer += f"{medal} **{p['title'][:60]}**\n"
-        answer += f"💰 Цена: {p['price']:.0f} ₽\n"
-        answer += f"⭐ Рейтинг: {p['rating']:.1f}/5\n"
-        answer += f"🚚 Доставка: {p['delivery_cost']:.0f} ₽, {p['delivery_days']} дн.\n"
-        answer += f"📊 Балл: {p['score']:.2f}\n"
-        answer += f"[Ссылка]({p['url']})\n\n"
 
-    if top3:
-        justification = generate_justification(top3[0], products)
-        answer += f"💡 **Почему первое место?**\n{justification}\n\n"
-        answer += "ℹ️ Цены и доставка примерные. Уточняйте на сайте."
+    # Первый товар
+    p1 = top3[0]
+    answer += f"🥇 **{p1['title'][:80]}**\n"
+    answer += f"💰 Цена: {p1['price']:.0f} ₽\n"
+    answer += f"⭐ Рейтинг: {p1['rating']:.1f}/5\n"
+    answer += f"🚚 Доставка: {p1['delivery_cost']:.0f} ₽, {p1['delivery_days']} дн.\n"
+    answer += f"📊 Балл: {p1['score']:.2f}\n"
+    answer += f"[Ссылка]({p1['url']})\n\n"
 
+    justification = generate_justification(p1, products)
+    answer += f"💡 **Почему первое место?**\n{justification}\n\n"
+
+    # Второй и третий кратко
+    for idx, p in enumerate(top3[1:], start=2):
+        medal = "🥈" if idx == 2 else "🥉"
+        answer += f"{medal} **{p['title'][:60]}** — {p['price']:.0f} ₽, доставка {p['delivery_cost']:.0f} ₽ / {p['delivery_days']} дн. [Ссылка]({p['url']})\n"
+
+    answer += "\nℹ️ Цены и доставка примерные. Уточняйте на сайте."
     await update.message.reply_text(answer, parse_mode='Markdown')
-    await update.message.reply_text("✅ Готово! Напиши новый запрос, например: `видеокарта москва`")
+    await update.message.reply_text("✅ Готово! Отправь новый запрос или используй /start.")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('help', help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Бот запущен.")
+    print("Бот запущен. Жду сообщений...")
     app.run_polling()
 
 if __name__ == '__main__':
