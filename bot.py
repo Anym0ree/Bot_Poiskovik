@@ -46,6 +46,16 @@ def extract_city(text: str) -> Optional[str]:
             return city
     return None
 
+def extract_product_query(text: str, city: str = None) -> str:
+    """Оставляет только ключевые слова товара (модель), убирая город и лишние слова."""
+    query = text
+    if city:
+        query = re.sub(r'\b' + re.escape(city) + r'\b', '', query, flags=re.IGNORECASE)
+    # Удаляем типичные слова-паразиты
+    query = re.sub(r'\b(в|во|на|для|купить|цена|с доставкой|материнская плата|материнку|материнка|процессор|видеокарта|оперативная память|ssd|блок питания)\b', '', query, flags=re.IGNORECASE)
+    query = re.sub(r'\s+', ' ', query).strip()
+    return query if query else text
+
 def parse_price(s: str) -> float:
     s = s.replace(' ', '').replace(',', '.')
     try:
@@ -129,13 +139,9 @@ def generate_justification(best, products):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
-    user_id = update.effective_user.id
-
-    # Получаем состояние пользователя
     state = context.user_data.get('state', '')
     pending_query = context.user_data.get('pending_query', '')
 
-    # Если ждём город
     if state == 'awaiting_city':
         city = extract_city(user_text) or user_text
         context.user_data['city'] = city
@@ -146,28 +152,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await perform_search(update, context, query, city)
         return
 
-    # Новый запрос – пытаемся найти город
     city = extract_city(user_text)
     if city:
-        # Город есть – сразу ищем
         context.user_data.clear()
         await update.message.chat.send_action(ChatAction.TYPING)
         await update.message.reply_text("🔍 Ищу товары...")
         await perform_search(update, context, user_text, city)
     else:
-        # Города нет – запоминаем запрос и спрашиваем город
         context.user_data['pending_query'] = user_text
         context.user_data['state'] = 'awaiting_city'
-        await update.message.reply_text("🌆 В каком городе ищем? Напиши название города (например, Москва, Казань)")
+        await update.message.reply_text("🌆 В каком городе ищем? Напиши название (Москва, Казань и т.д.)")
 
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, full_query: str, city: str):
+    # Очищаем запрос от лишних слов, оставляем модель товара
+    product_query = extract_product_query(full_query, city)
+    search_query = f"{product_query} {city} купить"
+    logger.info(f"Search query: {search_query}")
+
     try:
         client = TavilyClient(api_key=TAVILY_API_KEY)
-        # Пробуем с ограничением по сайтам
         site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:6]])
-        results = client.search(f"{full_query} {city} ({site_query})", max_results=15, search_depth="advanced")
+        results = client.search(f"{search_query} ({site_query})", max_results=20, search_depth="advanced")
         if len(results.get('results', [])) < 3:
-            results = client.search(f"{full_query} {city}", max_results=15, search_depth="advanced")
+            results = client.search(search_query, max_results=20, search_depth="advanced")
     except Exception as e:
         logger.error(f"Tavily error: {e}")
         await update.message.reply_text("❌ Ошибка при поиске. Попробуй позже.")
@@ -183,6 +190,7 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
         await update.message.reply_text("😕 Не нашёл товары в магазинах. Попробуй изменить запрос или город.")
         return
 
+    # Нормализация и подсчёт баллов
     prices = [p['price'] for p in products]
     ratings = [p['rating']/5 for p in products]
     costs = [p['delivery_cost'] for p in products]
@@ -215,12 +223,12 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
         answer += "ℹ️ Цены и доставка примерные. Уточняйте на сайте."
 
     await update.message.reply_text(answer, parse_mode='Markdown')
-    await update.message.reply_text("✅ Готово! Просто напиши новый запрос, например: `монитор 240hz москва`")
+    await update.message.reply_text("✅ Готово! Напиши новый запрос, например: `видеокарта москва`")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Бот запущен. Жду сообщений...")
+    print("Бот запущен.")
     app.run_polling()
 
 if __name__ == '__main__':
