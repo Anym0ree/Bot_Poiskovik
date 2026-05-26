@@ -1,10 +1,3 @@
-import subprocess
-import sys
-
-# --- Жёсткая очистка и переустановка tavily ---
-subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "tavily-python"], capture_output=True)
-subprocess.run([sys.executable, "-m", "pip", "install", "--force-reinstall", "tavily==0.5.0"], capture_output=True)
-# ---------------------------------------------
 
 import re
 import logging
