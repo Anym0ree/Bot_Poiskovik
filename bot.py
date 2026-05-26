@@ -23,19 +23,58 @@ if not TELEGRAM_TOKEN or not TAVILY_API_KEY:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MIN_PRICE = 2000
+MIN_PRICE = 500  # минимальная цена для фильтрации совсем мусора
+
+# Список городов
 CITIES = {
     "москва", "мск", "санкт-петербург", "спб", "новосибирск", "екатеринбург",
     "казань", "нижний новгород", "челябинск", "омск", "самара", "ростов-на-дону",
     "уфа", "красноярск", "пермь", "воронеж", "волгоград", "краснодар"
 }
 
+# Белый список доменов магазинов (можно расширять)
 ALLOWED_DOMAINS = [
     "ozon.ru", "wildberries.ru", "market.yandex.ru", "citilink.ru", "dns-shop.ru",
     "mvideo.ru", "eldorado.ru", "technopark.ru", "onlinetrade.ru", "regard.ru",
     "xcom-shop.ru", "computeruniverse.ru", "pcshop.ru", "compyou.ru",
-    "megamarket.ru", "holodilnik.ru", "re-store.ru", "nix.ru", "knsneva.ru"
+    "megamarket.ru", "holodilnik.ru", "re-store.ru", "nix.ru", "knsneva.ru",
+    "avito.ru", "goods.ru", "tehnosila.ru", "electrozone.ru", "ultracomp.ru"
 ]
+
+# Слова-паразиты, которые удаляем при извлечении модели
+STOP_WORDS = [
+    "материнская плата", "мат плата", "материнка", "мать", "motherboard",
+    "купить", "цена", "стоимость", "доставка", "в", "на", "для", "с", "и", "за",
+    "процессор", "видеокарта", "оперативная память", "ssd", "блок питания",
+    "материнскую", "плату", "лучший", "топ", "дешево"
+]
+
+def extract_keywords(text: str, city: str = None) -> str:
+    """Извлекает ключевые слова товара (модель), убирая город и стоп-слова."""
+    query = text.lower()
+    if city:
+        query = re.sub(r'\b' + re.escape(city.lower()) + r'\b', '', query)
+    for word in STOP_WORDS:
+        query = re.sub(r'\b' + re.escape(word) + r'\b', '', query, flags=re.IGNORECASE)
+    # Убираем лишние символы и пробелы
+    query = re.sub(r'[^\w\s]', '', query)
+    query = re.sub(r'\s+', ' ', query).strip()
+    # Если после чистки осталось пусто, возвращаем исходный запрос (хотя бы что-то)
+    return query if query else text.lower()
+
+def is_relevant(product_title: str, keywords: str) -> bool:
+    """Проверяет, содержит ли название товара основные ключевые слова модели."""
+    if not keywords:
+        return True
+    title_lower = product_title.lower()
+    keyword_parts = keywords.split()
+    # Для коротких запросов (1-2 слова) достаточно одного совпадения
+    if len(keyword_parts) <= 2:
+        return any(part in title_lower for part in keyword_parts)
+    else:
+        # Для длинных – хотя бы половина слов должна быть
+        matched = sum(1 for part in keyword_parts if part in title_lower)
+        return matched >= len(keyword_parts) // 2
 
 def is_allowed_url(url: str) -> bool:
     return any(domain in url.lower() for domain in ALLOWED_DOMAINS)
@@ -47,75 +86,84 @@ def extract_city(text: str) -> Optional[str]:
             return city
     return None
 
-def extract_product_query(text: str, city: str = None) -> str:
-    query = text
-    if city:
-        query = re.sub(r'\b' + re.escape(city) + r'\b', '', query, flags=re.IGNORECASE)
-    query = re.sub(r'\b(в|во|на|для|купить|цена|с доставкой|материнская плата|материнку|материнка|процессор|видеокарта|оперативная память|ssd|блок питания)\b', '', query, flags=re.IGNORECASE)
-    query = re.sub(r'\s+', ' ', query).strip()
-    return query if query else text
-
 def parse_price(s: str) -> float:
     s = s.replace(' ', '').replace(',', '.')
     try:
         price = float(s)
-        return price if price >= MIN_PRICE else 0.0
+        if price < MIN_PRICE:
+            return 0.0
+        return price
     except:
         return 0.0
 
-def is_out_of_stock(content: str) -> bool:
-    """Проверяет, есть ли признаки отсутствия товара."""
-    out_of_stock_phrases = [
-        "нет в наличии", "ожидается", "поставка", "заканчивается", "товар закончился",
-        "недоступен", "предзаказ", "нет на складе", "out of stock", "под заказ"
-    ]
+def extract_availability(content: str) -> str:
+    """Определяет статус наличия товара."""
     content_lower = content.lower()
-    return any(phrase in content_lower for phrase in out_of_stock_phrases)
+    if "нет в наличии" in content_lower or "ожидается" in content_lower or "под заказ" in content_lower:
+        return "❌ Нет в наличии"
+    if "в наличии" in content_lower:
+        return "✅ В наличии"
+    return "❔ Наличие не указано"
 
-def extract_product_info(snippet: Dict[str, Any]) -> Optional[Dict]:
+def extract_product_info(snippet: Dict[str, Any], keywords: str) -> Optional[Dict]:
     url = snippet.get('url', '')
     if not is_allowed_url(url):
         return None
+
     content = snippet.get('content', '') or snippet.get('raw_content', '')
     if not content:
         return None
 
-    # Пропускаем товары, которых нет в наличии
-    if is_out_of_stock(content):
-        return None
-
     title = snippet.get('title', '')
 
-    price_match = re.search(r'(\d{1,3}(?:[ \d]{0,3})?(?:[.,]\d{2})?)\s*(?:₽|руб|р|RUB)', content, re.IGNORECASE)
-    if not price_match:
-        return None
-    price = parse_price(price_match.group(1))
-    if price == 0:
+    # Фильтрация по ключевым словам модели
+    if keywords and not is_relevant(title, keywords):
         return None
 
+    # Цена
+    price_match = re.search(r'(\d{1,3}(?:[ \d]{0,3})?(?:[.,]\d{2})?)\s*(?:₽|руб|р|RUB)', content, re.IGNORECASE)
+    price = parse_price(price_match.group(1)) if price_match else 0.0
+    # Если цена не найдена – все равно показываем, но с пометкой
+    price_str = f"{price:.0f} ₽" if price > 0 else "❓ Цена не указана"
+
+    # Рейтинг (если есть)
     rating_match = re.search(r'(\d(?:[.,]\d)?)\s*[/]?\s*5', content)
     rating = float(rating_match.group(1).replace(',', '.')) if rating_match else 0.0
     rating = min(rating, 5.0)
+    rating_str = f"{rating:.1f}/5" if rating > 0 else "нет рейтинга"
 
+    # Доставка
     delivery_cost = 0.0
+    delivery_cost_str = "❓ не указана"
+    delivery_days_str = "❓ не указан"
     delivery_text = re.search(r'доставк[ае][:]*\s*([\d\s.,]+)\s*(?:₽|руб|р)?', content, re.IGNORECASE)
     if delivery_text:
         cost_str = re.sub(r'[^\d.,]', '', delivery_text.group(1))
         if cost_str:
             delivery_cost = parse_price(cost_str)
-    if 'бесплатно' in content.lower():
-        delivery_cost = 0.0
+            if delivery_cost > 0:
+                delivery_cost_str = f"{delivery_cost:.0f} ₽"
+            elif delivery_cost == 0:
+                delivery_cost_str = "бесплатно"
+    if 'бесплатно' in content.lower() and delivery_cost_str == "❓ не указана":
+        delivery_cost_str = "бесплатно"
 
     days_match = re.search(r'(\d{1,2})\s*(?:дн|день|дня|дней)', content, re.IGNORECASE)
-    delivery_days = int(days_match.group(1)) if days_match else 5
+    if days_match:
+        delivery_days_str = f"{int(days_match.group(1))} дн."
+
+    availability = extract_availability(content)
 
     return {
         'title': title,
         'price': price,
-        'rating': rating,
-        'delivery_cost': delivery_cost,
-        'delivery_days': delivery_days,
-        'url': url
+        'price_str': price_str,
+        'rating_str': rating_str,
+        'delivery_cost_str': delivery_cost_str,
+        'delivery_days_str': delivery_days_str,
+        'availability': availability,
+        'url': url,
+        'score': 0.0  # будет заполнено позже
     }
 
 def normalize_list(values: List[float]) -> List[float]:
@@ -128,36 +176,35 @@ def normalize_list(values: List[float]) -> List[float]:
 
 def generate_justification(best: Dict, products: List[Dict]) -> str:
     reasons = []
-    prices = [p['price'] for p in products]
-    if best['price'] == min(prices):
-        reasons.append("✅ самая низкая цена")
-    else:
-        diff = best['price'] - min(prices)
-        reasons.append(f"💰 цена всего на {diff:.0f} ₽ выше минимальной")
-
-    ratings = [p['rating'] for p in products]
-    if best['rating'] == max(ratings) and best['rating'] > 0:
-        reasons.append(f"⭐ наивысший рейтинг ({best['rating']:.1f})")
-
-    costs = [p['delivery_cost'] for p in products]
-    if best['delivery_cost'] == min(costs):
-        reasons.append("🚚 самая дешёвая доставка")
-    days = [p['delivery_days'] for p in products]
-    if best['delivery_days'] == min(days):
-        reasons.append("⚡ самая быстрая доставка")
-
+    # Сравниваем только те товары, у которых есть цена
+    priced_products = [p for p in products if p['price'] > 0]
+    if priced_products and best.get('price', 0) > 0:
+        prices = [p['price'] for p in priced_products]
+        if best['price'] == min(prices):
+            reasons.append("✅ самая низкая цена")
+        else:
+            diff = best['price'] - min(prices)
+            reasons.append(f"💰 цена всего на {diff:.0f} ₽ выше минимальной")
+    if best.get('availability') == "✅ В наличии":
+        reasons.append("📦 есть в наличии")
+    if "бесплатно" in best.get('delivery_cost_str', ''):
+        reasons.append("🚚 бесплатная доставка")
+    # про рейтинг добавим только если он есть
+    if best.get('rating_str') and best['rating_str'] != "нет рейтинга":
+        reasons.append(f"⭐ рейтинг {best['rating_str']}")
     if not reasons:
         reasons.append("сбалансированные характеристики")
     return "📌 " + ". ".join(reasons)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🛒 **Помощник по поиску товаров для ПК и электроники**\n\n"
-        "Просто напиши, что хочешь найти, например:\n"
+        "🛒 **Помощник по поиску комплектующих**\n\n"
+        "Я ищу процессоры, видеокарты, материнские платы и другие компоненты.\n"
+        "Просто напиши запрос, например:\n"
         "`материнская плата asus prime z370 казань`\n"
-        "`iphone 15 pro москва`\n\n"
+        "`rtx 3060 москва`\n\n"
         "Если город не укажешь — спрошу отдельно.\n"
-        "Я покажу ТОП-3 товара с ценами, рейтингом и доставкой.\n\n"
+        "Показываю ТОП-3 с ценами, наличием, доставкой и ссылками.\n\n"
         "Команды: /help, /start",
         parse_mode='Markdown'
     )
@@ -165,13 +212,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔍 **Как я работаю**\n"
-        "1. Отправь запрос: `товар город` (например, `видеокарта москва`)\n"
-        "2. Если города нет — я спрошу.\n"
-        "3. Ищу только в проверенных магазинах РФ (Ozon, Яндекс.Маркет, DNS и др.)\n"
-        "4. Пропускаю товары, которых нет в наличии.\n"
-        "5. Рассчитываю балл: низкая цена, высокий рейтинг, быстрая/дешёвая доставка.\n"
-        "6. Выдаю ТОП-3: первый — подробно, остальные — кратко, но со ссылками.\n\n"
-        "Просто напиши новый запрос, чтобы продолжить."
+        "1. Ты отправляешь запрос: `модель город`\n"
+        "2. Я ищу на популярных маркетплейсах РФ.\n"
+        "3. Показываю реальное наличие, цену, стоимость и срок доставки.\n"
+        "4. Первый товар – с подробным обоснованием, остальные – кратко со ссылками.\n"
+        "5. Если какой-то информации нет – пишу «не указано».\n\n"
+        "Просто отправь новый запрос, чтобы продолжить."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,78 +247,87 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🌆 В каком городе ищем? Напиши название (Москва, Казань и т.д.)")
 
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, full_query: str, city: str):
-    product_query = extract_product_query(full_query, city)
-    search_query = f"{product_query} {city} купить"
-    logger.info(f"Search query: {search_query}")
+    # Извлекаем ключевые слова модели
+    keywords = extract_keywords(full_query, city)
+    search_query = f"{keywords} {city} купить" if keywords else f"{full_query} {city} купить"
+    logger.info(f"Search query: {search_query} | Keywords: {keywords}")
 
     try:
         client = TavilyClient(api_key=TAVILY_API_KEY)
-        site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:8]])
-        results = client.search(f"{search_query} ({site_query})", max_results=25, search_depth="advanced")
+        # Сначала пробуем искать с ограничением по магазинам
+        site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:10]])
+        results = client.search(f"{search_query} ({site_query})", max_results=30, search_depth="advanced")
         if len(results.get('results', [])) < 3:
-            results = client.search(search_query, max_results=25, search_depth="advanced")
+            # Если мало результатов, ищем без site:
+            results = client.search(search_query, max_results=30, search_depth="advanced")
     except Exception as e:
         logger.error(f"Tavily error: {e}")
-        await update.message.reply_text("❌ Ошибка при поиске. Попробуй позже.")
+        await update.message.reply_text("❌ Ошибка при поиске. Попробуйте позже.")
         return
 
+    # Извлекаем информацию о товарах
     products = []
     for item in results.get('results', []):
-        info = extract_product_info(item)
+        info = extract_product_info(item, keywords)
         if info:
             products.append(info)
 
     if not products:
-        await update.message.reply_text("😕 Не нашёл товары в наличии в магазинах. Попробуй изменить запрос или город.")
+        await update.message.reply_text("😕 Не удалось найти товары по вашему запросу. Попробуйте изменить модель или город.")
         return
 
-    # Нормализация и рейтинг
-    prices = [p['price'] for p in products]
-    ratings = [p['rating']/5 for p in products]
-    costs = [p['delivery_cost'] for p in products]
-    days = [p['delivery_days'] for p in products]
-
-    norm_prices = normalize_list(prices)
-    norm_ratings = normalize_list(ratings)
-    norm_costs = normalize_list(costs)
-    norm_days = normalize_list(days)
-
-    for i, p in enumerate(products):
-        p['score'] = 0.4*norm_prices[i] + 0.3*norm_ratings[i] + 0.15*norm_costs[i] + 0.15*norm_days[i]
+    # Сортировка по баллу (учитываем только цену и наличие)
+    for p in products:
+        # Балл: учитываем цену (чем ниже, тем лучше) и наличие (в наличии + балл)
+        price_norm = 0.0
+        if p['price'] > 0:
+            # временно для сортировки – позже пересчитаем нормализованно
+            p['temp_price'] = p['price']
+        else:
+            p['temp_price'] = 1e9  # большая цена, чтобы уходил вниз
+    # Нормализуем цены среди тех, у кого цена >0
+    prices = [p['price'] for p in products if p['price'] > 0]
+    norm_prices = normalize_list(prices) if prices else []
+    price_idx = 0
+    for p in products:
+        if p['price'] > 0:
+            p['norm_price'] = norm_prices[price_idx]
+            price_idx += 1
+        else:
+            p['norm_price'] = 0.0
+        # Бонус за наличие
+        availability_bonus = 0.3 if p['availability'] == "✅ В наличии" else 0.0
+        p['score'] = p['norm_price'] + availability_bonus
 
     products.sort(key=lambda x: x['score'], reverse=True)
     top3 = products[:3]
 
-    # Формируем ответ: первый подробно, остальные кратко
+    # Формируем ответ
     answer = f"🔍 **Результаты для «{full_query}»** (город: {city})\n\n"
+    for idx, p in enumerate(top3, 1):
+        if idx == 1:
+            answer += f"🥇 **{p['title'][:80]}**\n"
+            answer += f"💰 Цена: {p['price_str']}\n"
+            answer += f"⭐ Рейтинг: {p['rating_str']}\n"
+            answer += f"🚚 Доставка: {p['delivery_cost_str']}, {p['delivery_days_str']}\n"
+            answer += f"📦 Наличие: {p['availability']}\n"
+            answer += f"[Ссылка]({p['url']})\n\n"
+            justification = generate_justification(p, products)
+            answer += f"💡 **Почему первое место?**\n{justification}\n\n"
+        else:
+            medal = "🥈" if idx == 2 else "🥉"
+            answer += f"{medal} **{p['title'][:60]}** — Цена: {p['price_str']}, Доставка: {p['delivery_cost_str']} / {p['delivery_days_str']}, Наличие: {p['availability']}\n[Ссылка]({p['url']})\n\n"
 
-    # Первый товар
-    p1 = top3[0]
-    answer += f"🥇 **{p1['title'][:80]}**\n"
-    answer += f"💰 Цена: {p1['price']:.0f} ₽\n"
-    answer += f"⭐ Рейтинг: {p1['rating']:.1f}/5\n"
-    answer += f"🚚 Доставка: {p1['delivery_cost']:.0f} ₽, {p1['delivery_days']} дн.\n"
-    answer += f"📊 Балл: {p1['score']:.2f}\n"
-    answer += f"[Ссылка]({p1['url']})\n\n"
-
-    justification = generate_justification(p1, products)
-    answer += f"💡 **Почему первое место?**\n{justification}\n\n"
-
-    # Второй и третий кратко
-    for idx, p in enumerate(top3[1:], start=2):
-        medal = "🥈" if idx == 2 else "🥉"
-        answer += f"{medal} **{p['title'][:60]}** — {p['price']:.0f} ₽, доставка {p['delivery_cost']:.0f} ₽ / {p['delivery_days']} дн. [Ссылка]({p['url']})\n"
-
-    answer += "\nℹ️ Цены и доставка примерные. Уточняйте на сайте."
+    answer += "ℹ️ Информация о ценах и доставке может быть примерной. Уточняйте на сайте магазина."
     await update.message.reply_text(answer, parse_mode='Markdown')
-    await update.message.reply_text("✅ Готово! Отправь новый запрос или используй /start.")
+    await update.message.reply_text("✅ Готово! Отправьте новый запрос.")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Бот запущен. Жду сообщений...")
+    print("Бот запущен и готов к работе.")
     app.run_polling()
 
 if __name__ == '__main__':
