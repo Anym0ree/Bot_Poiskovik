@@ -14,7 +14,14 @@ from telegram.ext import (
 )
 from tavily import TavilyClient
 import os
-
+import os
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TAVILY_API_KEY = os.getenv('TAVILY_API_KEY')
+print(f"TELEGRAM_TOKEN present: {bool(TELEGRAM_TOKEN)}")
+print(f"TAVILY_API_KEY present: {bool(TAVILY_API_KEY)}")
+if not TELEGRAM_TOKEN or not TAVILY_API_KEY:
+    raise ValueError("Ошибка: не найдены TELEGRAM_TOKEN и/или TAVILY_API_KEY")
+    
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
