@@ -1,3 +1,13 @@
+import subprocess
+import sys
+import time
+
+# ----- Принудительная замена пакета tavily -----
+subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "tavily-python"])
+subprocess.call([sys.executable, "-m", "pip", "install", "tavily==0.5.0"])
+time.sleep(1)  # даём время на завершение
+# ---------------------------------------------
+
 import re
 import logging
 from typing import List, Dict, Any, Optional
@@ -11,16 +21,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import subprocess
-import sys
-
-def ensure_tavily():
-    try:
-        import tavily
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "tavily==0.5.0"])
-
-ensure_tavily()
 from tavily import TavilyClient
 import os
 
