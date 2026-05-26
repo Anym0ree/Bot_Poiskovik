@@ -1,11 +1,9 @@
 import subprocess
 import sys
-import time
 
-# ----- Принудительная замена пакета tavily -----
-subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "tavily-python"])
-subprocess.call([sys.executable, "-m", "pip", "install", "tavily==0.5.0"])
-time.sleep(1)  # даём время на завершение
+# --- Жёсткая очистка и переустановка tavily ---
+subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "tavily-python"], capture_output=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "--force-reinstall", "tavily==0.5.0"], capture_output=True)
 # ---------------------------------------------
 
 import re
