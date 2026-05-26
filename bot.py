@@ -3,7 +3,8 @@ import logging
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 load_dotenv()
-from telegram import Update, ChatAction
+from telegram import Update
+from telegram.constants import ChatAction  # правильный импорт ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -27,13 +28,17 @@ MIN_PRICE = 2000
 CITIES = {
     "москва", "мск", "санкт-петербург", "спб", "новосибирск", "екатеринбург",
     "казань", "нижний новгород", "челябинск", "омск", "самара", "ростов-на-дону",
-    "уфа", "красноярск", "пермь", "воронеж", "волгоград", "краснодар"
+    "уфа", "красноярск", "пермь", "воронеж", "волгоград", "краснодар",
+    "киров", "тула", "ярославль", "иркутск", "хабаровск", "владивосток"
 }
 
+# Расширенный список доменов магазинов (федеральные + региональные)
 ALLOWED_DOMAINS = [
-    "ozon.ru", "wildberries.ru", "market.yandex.ru", "citilink.ru", "dns-shop.ru",
-    "mvideo.ru", "eldorado.ru", "technopark.ru", "onlinetrade.ru", "regard.ru",
-    "xcom-shop.ru", "computeruniverse.ru", "pcshop.ru", "compyou.ru"
+    "ozon.ru", "wildberries.ru", "megamarket.ru", "market.yandex.ru",
+    "dns-shop.ru", "citilink.ru", "mvideo.ru", "eldorado.ru", "technopark.ru",
+    "onlinetrade.ru", "regard.ru", "xcom-shop.ru", "computeruniverse.ru",
+    "pcshop.ru", "compyou.ru", "nix.ru", "re-store.ru", "holodilnik.ru",
+    "knsneva.ru", "technopoint.ru", "ulmart.ru", "avito.ru"
 ]
 
 def is_allowed_url(url: str) -> bool:
@@ -51,7 +56,6 @@ def extract_product_query(text: str, city: str = None) -> str:
     query = text
     if city:
         query = re.sub(r'\b' + re.escape(city) + r'\b', '', query, flags=re.IGNORECASE)
-    # Удаляем типичные слова-паразиты
     query = re.sub(r'\b(в|во|на|для|купить|цена|с доставкой|материнская плата|материнку|материнка|процессор|видеокарта|оперативная память|ssd|блок питания)\b', '', query, flags=re.IGNORECASE)
     query = re.sub(r'\s+', ' ', query).strip()
     return query if query else text
@@ -164,14 +168,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🌆 В каком городе ищем? Напиши название (Москва, Казань и т.д.)")
 
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, full_query: str, city: str):
-    # Очищаем запрос от лишних слов, оставляем модель товара
     product_query = extract_product_query(full_query, city)
     search_query = f"{product_query} {city} купить"
     logger.info(f"Search query: {search_query}")
 
     try:
         client = TavilyClient(api_key=TAVILY_API_KEY)
-        site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:6]])
+        site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:10]])
         results = client.search(f"{search_query} ({site_query})", max_results=20, search_depth="advanced")
         if len(results.get('results', [])) < 3:
             results = client.search(search_query, max_results=20, search_depth="advanced")
@@ -190,7 +193,6 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
         await update.message.reply_text("😕 Не нашёл товары в магазинах. Попробуй изменить запрос или город.")
         return
 
-    # Нормализация и подсчёт баллов
     prices = [p['price'] for p in products]
     ratings = [p['rating']/5 for p in products]
     costs = [p['delivery_cost'] for p in products]
