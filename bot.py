@@ -3,11 +3,13 @@ import logging
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 load_dotenv()
-from telegram import Update, constants
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -23,29 +25,32 @@ if not TELEGRAM_TOKEN or not TAVILY_API_KEY:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Минимальные реальные цены
-GPU_MIN_PRICE = 15000
-CPU_MIN_PRICE = 5000
-DEFAULT_MIN_PRICE = 2000
+# Только нужные магазины
+ALLOWED_DOMAINS = ["dns-shop.ru", "citilink.ru", "mvideo.ru"]
 
-CITIES = {
-    "москва", "мск", "санкт-петербург", "спб", "новосибирск", "екатеринбург",
-    "казань", "нижний новгород", "челябинск", "омск", "самара", "ростов-на-дону",
-    "уфа", "красноярск", "пермь", "воронеж", "волгоград", "краснодар"
-}
-
-ALLOWED_DOMAINS = [
-    "dns-shop.ru", "citilink.ru", "mvideo.ru", "eldorado.ru", "technopark.ru",
-    "ozon.ru", "wildberries.ru", "market.yandex.ru", "megamarket.ru", "regard.ru",
-    "onlinetrade.ru", "xcom-shop.ru", "pcshop.ru", "compyou.ru", "nix.ru"
-]
-
-# Паттерны товарных URL
+# Паттерны товарных URL для этих магазинов
 PRODUCT_URL_PATTERNS = [
-    r'/product/', r'/item/', r'/p/', r'/goods/', r'/card/', r'/offer/',
-    r'/show/', r'/catalog/.*/product/', r'/tovar/', r'/model/', r'/sku/',
-    r'/\d+\.html', r'/\d+/', r'/dp/', r'/gp/'
+    r'/product/', r'/products/', r'/catalog/product/', r'/item/',
+    r'/p/', r'/goods/', r'/card/', r'/offer/',
+    r'/tovar/', r'/model/', r'/sku/', r'\d+\.html', r'/dp/', r'/gp/'
 ]
+
+# Состояния диалога
+CITY, ACCURACY, QUERY = range(3)
+
+# Кнопки городов
+CITY_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Москва", callback_data="city_moscow"),
+     InlineKeyboardButton("Казань", callback_data="city_kazan")]
+])
+
+# Кнопки точности
+ACCURACY_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔎 Точная модель", callback_data="accuracy_exact"),
+     InlineKeyboardButton("💸 Подходящий товар (по описанию/цене)", callback_data="accuracy_general")]
+])
+
+# --- Вспомогательные функции (улучшенные) ---
 
 def is_product_url(url: str) -> bool:
     url_lower = url.lower()
@@ -57,46 +62,40 @@ def is_product_url(url: str) -> bool:
 def is_allowed_url(url: str) -> bool:
     return is_product_url(url) and any(domain in url.lower() for domain in ALLOWED_DOMAINS)
 
-def extract_city(text: str) -> Optional[str]:
-    text_lower = text.lower()
-    for city in CITIES:
-        if city in text_lower:
-            return city
-    return None
-
-def extract_keywords(text: str, city: str = None) -> str:
+def extract_keywords(text: str) -> str:
+    """Очистка запроса от стоп-слов для фильтрации по ключевым словам"""
     query = text.lower()
-    if city:
-        query = re.sub(r'\b' + re.escape(city.lower()) + r'\b', '', query)
-    # удаляем стоп-слова
-    stop_words = ["материнская плата", "мат плата", "материнка", "купить", "цена", "доставка", "в", "на", "для", "с", "и", "за"]
+    # добавляем специфичные для техники стоп-слова
+    stop_words = ["купить", "цена", "доставка", "в", "на", "для", "с", "и", "за",
+                  "москва", "казань", "мск"]
     for w in stop_words:
-        query = re.sub(r'\b' + re.escape(w) + r'\b', '', query, flags=re.IGNORECASE)
+        query = re.sub(r'\b' + re.escape(w) + r'\b', '', query)
     query = re.sub(r'[^\w\s]', '', query)
     query = re.sub(r'\s+', ' ', query).strip()
     return query if query else text.lower()
 
-def detect_product_type(query: str) -> str:
-    q = query.lower()
-    if 'видеокарт' in q or 'rtx' in q or 'gpu' in q:
-        return 'gpu'
-    if 'процессор' in q or 'cpu' in q:
-        return 'cpu'
-    return 'other'
+def is_relevant(title: str, keywords: str, exact_mode: bool) -> bool:
+    """Проверка релевантности: в точном режиме все слова должны быть в заголовке,
+       в общем – хотя бы половина."""
+    if not keywords:
+        return True
+    title_lower = title.lower()
+    parts = keywords.split()
+    if exact_mode:
+        # Все ключевые слова должны присутствовать (можно ослабить до большинства)
+        return all(p in title_lower for p in parts)
+    else:
+        if len(parts) <= 2:
+            return any(p in title_lower for p in parts)
+        matched = sum(1 for p in parts if p in title_lower)
+        return matched >= len(parts) // 2
 
-def parse_price(price_str: str, product_type: str) -> float:
+def parse_price(price_str: str) -> float:
+    """Извлечение цены и проверка на реалистичность (минимум 100 руб.)"""
     price_str = price_str.replace(' ', '').replace(',', '.')
     try:
         price = float(price_str)
-        if price <= 0:
-            return 0.0
-        if product_type == 'gpu' and price < GPU_MIN_PRICE:
-            return 0.0
-        if product_type == 'cpu' and price < CPU_MIN_PRICE:
-            return 0.0
-        if product_type == 'other' and price < DEFAULT_MIN_PRICE:
-            return 0.0
-        return price
+        return price if price >= 100 else 0.0
     except:
         return 0.0
 
@@ -108,18 +107,7 @@ def extract_availability(content: str) -> str:
         return "✅ В наличии"
     return "❔ Наличие не указано"
 
-def is_relevant(title: str, keywords: str) -> bool:
-    if not keywords:
-        return True
-    title_lower = title.lower()
-    parts = keywords.split()
-    if len(parts) <= 2:
-        return any(p in title_lower for p in parts)
-    else:
-        matched = sum(1 for p in parts if p in title_lower)
-        return matched >= len(parts) // 2
-
-def extract_product_info(snippet: Dict[str, Any], keywords: str, product_type: str) -> Optional[Dict]:
+def extract_product_info(snippet: Dict[str, Any], keywords: str, exact_mode: bool) -> Optional[Dict]:
     url = snippet.get('url', '')
     if not is_allowed_url(url):
         return None
@@ -129,35 +117,34 @@ def extract_product_info(snippet: Dict[str, Any], keywords: str, product_type: s
         return None
 
     title = snippet.get('title', '')
-    if keywords and not is_relevant(title, keywords):
+    if keywords and not is_relevant(title, keywords, exact_mode):
         return None
 
-    # Усиленный поиск цены: ищем любую цифру с валютой
+    # Поиск цены (усиленный regex)
     price_match = re.search(r'(\d{1,3}(?:[ \d]{0,3})?(?:[.,]\d{2})?)\s*(?:₽|руб|р|RUB)', content, re.IGNORECASE)
     price = 0.0
     price_str = "❓ Цена не указана"
     if price_match:
-        price = parse_price(price_match.group(1), product_type)
+        price = parse_price(price_match.group(1))
         if price > 0:
             price_str = f"{price:.0f} ₽"
 
-    # Рейтинг (если есть)
+    # Рейтинг
     rating_str = "нет рейтинга"
     rating_match = re.search(r'(\d(?:[.,]\d)?)\s*[/]?\s*5', content)
     if rating_match:
         rating = float(rating_match.group(1).replace(',', '.'))
-        rating = min(rating, 5.0)
-        if rating > 0:
+        if 0 < rating <= 5:
             rating_str = f"{rating:.1f}/5"
 
-    # Доставка (стоимость и срок)
+    # Доставка
     delivery_cost_str = "❓ не указана"
     delivery_days_str = "❓ не указан"
     deliv_cost_match = re.search(r'доставк[ае][:]*\s*(\d[\d\s.,]*)\s*(?:₽|руб|р)?', content, re.IGNORECASE)
     if deliv_cost_match:
         cost_clean = re.sub(r'[^\d.,]', '', deliv_cost_match.group(1))
         if cost_clean:
-            cost = parse_price(cost_clean, 'other')
+            cost = parse_price(cost_clean)
             if cost > 0:
                 delivery_cost_str = f"{cost:.0f} ₽"
             elif cost == 0:
@@ -179,28 +166,26 @@ def extract_product_info(snippet: Dict[str, Any], keywords: str, product_type: s
         'delivery_cost_str': delivery_cost_str,
         'delivery_days_str': delivery_days_str,
         'availability': availability,
-        'url': url,
-        'score': 0.0
+        'url': url
     }
 
-def normalize_list(values: List[float]) -> List[float]:
-    if not values:
-        return []
-    mn, mx = min(values), max(values)
-    if mx == mn:
-        return [0.5] * len(values)
-    return [(mx - v) / (mx - mn) for v in values]
-
-def generate_justification(best: Dict, all_products: List[Dict]) -> str:
+def generate_justification(best: Dict, all_products: List[Dict], mode_exact: bool) -> str:
     reasons = []
-    priced = [p for p in all_products if p['price'] > 0]
-    if priced and best['price'] > 0:
-        prices = [p['price'] for p in priced]
-        if best['price'] == min(prices):
-            reasons.append("✅ самая низкая цена")
+    if not best['price'] or best['price'] == 0:
+        reasons.append("⚠️ цена не указана")
+    else:
+        if mode_exact:
+            # Для точной модели важна цена, наличие, доставка
+            priced = [p for p in all_products if p['price'] > 0]
+            if priced:
+                if best['price'] == min(p['price'] for p in priced):
+                    reasons.append("✅ самая низкая цена")
+                else:
+                    reasons.append("💰 цена близка к минимальной")
         else:
-            diff = best['price'] - min(prices)
-            reasons.append(f"💰 цена всего на {diff:.0f} ₽ выше минимальной")
+            # Общий поиск – просто подчёркиваем, что выбрали самый дешёвый подходящий
+            reasons.append("🏷️ минимальная цена среди подходящих")
+
     if best['availability'] == "✅ В наличии":
         reasons.append("📦 есть в наличии")
     if "бесплатно" in best['delivery_cost_str']:
@@ -211,66 +196,76 @@ def generate_justification(best: Dict, all_products: List[Dict]) -> str:
         reasons.append("сбалансированные характеристики")
     return "📌 " + ". ".join(reasons)
 
+# --- Обработчики команд и диалога ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🛒 **Помощник по поиску комплектующих**\n\n"
-        "Напиши запрос с городом, например:\n"
-        "`rtx 3060 москва`\n"
-        "`материнская плата asus prime z370 казань`\n\n"
-        "Если город не укажешь — спрошу отдельно.\n"
-        "Я покажу карточки товаров с реальных магазинов.\n\n"
-        "Команды: /help, /start",
+        "🛒 **Поиск техники по Москве и Казани**\n\n"
+        "Выберите город:",
+        reply_markup=CITY_KEYBOARD,
         parse_mode='Markdown'
     )
+    return CITY
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔍 **Как я работаю**\n"
-        "1. Отправь запрос: `модель город`\n"
-        "2. Я ищу страницы товаров на DNS, Citilink, Ozon и других.\n"
-        "3. Извлекаю цену, рейтинг, доставку и наличие из короткого описания.\n"
-        "4. Если данных нет — пишу «не указано».\n"
-        "5. Показываю ТОП-3, где первый товар — с обоснованием.\n\n"
-        "Просто отправь новый запрос после ответа."
-    )
+async def city_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    city = "москва" if query.data == "city_moscow" else "казань"
+    context.user_data['city'] = city
+    await query.edit_message_text(f"🏙️ Город: **{city.capitalize()}**\n\n"
+                                  "Теперь уточните, что ищете:",
+                                  reply_markup=ACCURACY_KEYBOARD,
+                                  parse_mode='Markdown')
+    return ACCURACY
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.strip()
-    state = context.user_data.get('state', '')
-    pending_query = context.user_data.get('pending_query', '')
-
-    if state == 'awaiting_city':
-        city = extract_city(user_text) or user_text
-        context.user_data['city'] = city
-        query = pending_query
-        context.user_data.clear()
-        await update.message.chat.send_action(constants.ChatAction.TYPING)
-        await update.message.reply_text("🔍 Ищу товары...")
-        await perform_search(update, context, query, city)
-        return
-
-    city = extract_city(user_text)
-    if city:
-        context.user_data.clear()
-        await update.message.chat.send_action(constants.ChatAction.TYPING)
-        await update.message.reply_text("🔍 Ищу товары...")
-        await perform_search(update, context, user_text, city)
+async def accuracy_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    exact = query.data == "accuracy_exact"
+    context.user_data['exact'] = exact
+    if exact:
+        text = "🔎 Введите точную модель товара (например, `Samsung Galaxy S23` или `RTX 3060`):"
     else:
-        context.user_data['pending_query'] = user_text
-        context.user_data['state'] = 'awaiting_city'
-        await update.message.reply_text("🌆 В каком городе ищем? Напиши название (Москва, Казань и т.д.)")
+        text = "💸 Опишите, что хотите найти (например, `дешёвая ТВ-приставка`, `монитор до 10000 рублей`):"
+    await query.edit_message_text(text, parse_mode='Markdown')
+    return QUERY
 
-async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, full_query: str, city: str):
-    keywords = extract_keywords(full_query, city)
-    product_type = detect_product_type(full_query)
-    search_query = f"{keywords} {city} купить" if keywords else f"{full_query} {city} купить"
-    logger.info(f"Search: {search_query} | Keywords: {keywords}")
+async def search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip()
+    city = context.user_data['city']
+    exact = context.user_data.get('exact', False)
+    await update.message.chat.send_action("typing")
+    await update.message.reply_text("🔍 Ищу товары...")
+    await perform_search(update, context, user_text, city, exact)
+    # После завершения предлагаем начать заново
+    await update.message.reply_text(
+        "✅ Готово! Для нового поиска нажмите /start или просто введите любой запрос.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Новый поиск", callback_data="new_search")]])
+    )
+    return ConversationHandler.END
+
+async def new_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await start(update, context)
+    return CITY
+
+async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, user_query: str, city: str, exact: bool):
+    keywords = extract_keywords(user_query)
+    # Формируем поисковый запрос
+    if exact:
+        search_query = f"{user_query} {city} купить"
+    else:
+        search_query = f"{user_query} дешево {city} купить"
+
+    logger.info(f"Search: {search_query} | Exact: {exact}")
 
     try:
         client = TavilyClient(api_key=TAVILY_API_KEY)
-        site_query = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS[:10]])
-        results = client.search(f"{search_query} ({site_query})", max_results=30, search_depth="advanced")
-        if len(results.get('results', [])) < 3:
+        # Ищем только по трём магазинам
+        site_filter = ' OR '.join([f'site:{d}' for d in ALLOWED_DOMAINS])
+        results = client.search(f"{search_query} ({site_filter})", max_results=30, search_depth="advanced")
+        if not results.get('results'):
+            # Если совсем пусто, попробуем без фильтра
             results = client.search(search_query, max_results=30, search_depth="advanced")
     except Exception as e:
         logger.error(f"Tavily error: {e}")
@@ -279,54 +274,84 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ful
 
     products = []
     for item in results.get('results', []):
-        info = extract_product_info(item, keywords, product_type)
+        info = extract_product_info(item, keywords, exact)
         if info:
             products.append(info)
 
     if not products:
-        await update.message.reply_text("😕 Не удалось найти подходящие товары. Попробуйте изменить запрос или город.")
+        await update.message.reply_text("😕 Товары не найдены. Уточните запрос или попробуйте другую модель.")
         return
 
-    # Нормализация цен (только если есть цена)
-    prices = [p['price'] for p in products if p['price'] > 0]
-    norm_prices = normalize_list(prices) if prices else []
-    price_idx = 0
+    # Сортируем: для общего поиска – по возрастанию цены, для точного – тоже, но с учётом наличия
+    if exact:
+        # Сначала с ценой, потом без; внутри по цене
+        priced = [p for p in products if p['price'] > 0]
+        unpriced = [p for p in products if p['price'] == 0]
+        priced.sort(key=lambda x: x['price'])
+        products = priced + unpriced
+    else:
+        # Общий поиск: самые дешёвые вперёд, товары без цены в конец
+        products.sort(key=lambda x: (x['price'] == 0, x['price']))
+
+    # Лучший – первый (если с ценой), иначе первый с ценой
+    best = None
     for p in products:
         if p['price'] > 0:
-            p['norm_price'] = norm_prices[price_idx]
-            price_idx += 1
-        else:
-            p['norm_price'] = 0.0
-        availability_bonus = 0.3 if p['availability'] == "✅ В наличии" else 0.0
-        p['score'] = p['norm_price'] + availability_bonus
+            best = p
+            break
+    if not best:
+        best = products[0]  # если совсем без цен
 
-    products.sort(key=lambda x: x['score'], reverse=True)
-    top3 = products[:3]
+    # Формируем ответ
+    answer = f"🔍 **Результаты для «{user_query}»** ({city.capitalize()})\n"
+    answer += f"🎯 Режим: {'точная модель' if exact else 'подходящий товар по описанию'}\n\n"
 
-    answer = f"🔍 **Результаты для «{full_query}»** (город: {city})\n\n"
-    for idx, p in enumerate(top3, 1):
-        if idx == 1:
-            answer += f"🥇 **{p['title'][:80]}**\n"
-            answer += f"💰 Цена: {p['price_str']}\n"
-            answer += f"⭐ Рейтинг: {p['rating_str']}\n"
-            answer += f"🚚 Доставка: {p['delivery_cost_str']}, {p['delivery_days_str']}\n"
-            answer += f"📦 Наличие: {p['availability']}\n"
-            answer += f"[Ссылка]({p['url']})\n\n"
-            justification = generate_justification(p, products)
-            answer += f"💡 **Почему первое место?**\n{justification}\n\n"
-        else:
-            medal = "🥈" if idx == 2 else "🥉"
-            answer += f"{medal} **{p['title'][:60]}** — Цена: {p['price_str']}, Доставка: {p['delivery_cost_str']} / {p['delivery_days_str']}, Наличие: {p['availability']}\n[Ссылка]({p['url']})\n\n"
+    # Лучший вариант
+    answer += f"🏆 **Лучший вариант:**\n"
+    answer += f"📌 {best['title'][:80]}\n"
+    answer += f"💰 Цена: {best['price_str']}\n"
+    answer += f"⭐ Рейтинг: {best['rating_str']}\n"
+    answer += f"🚚 Доставка: {best['delivery_cost_str']}, {best['delivery_days_str']}\n"
+    answer += f"📦 Наличие: {best['availability']}\n"
+    answer += f"🔗 [Ссылка]({best['url']})\n\n"
+    justification = generate_justification(best, products, exact)
+    answer += f"💡 {justification}\n\n"
 
-    answer += "ℹ️ Информация о ценах и доставке может быть примерной. Уточняйте на сайте."
-    await update.message.reply_text(answer, parse_mode='Markdown')
-    await update.message.reply_text("✅ Готово! Отправьте новый запрос.")
+    # Все цены (до 10)
+    all_with_prices = [p for p in products if p['price'] > 0][:10]
+    if all_with_prices:
+        answer += "📊 **Все найденные цены (до 10):**\n"
+        for i, p in enumerate(all_with_prices, 1):
+            answer += f"{i}. {p['title'][:50]} — {p['price_str']} | {p['availability']}\n   {p['url']}\n"
+    else:
+        answer += "⚠️ Цены не найдены ни в одном товаре.\n"
+
+    answer += "\nℹ️ Информация о ценах и доставке может быть примерной. Уточняйте на сайте магазина."
+    await update.message.reply_text(answer, parse_mode='Markdown', disable_web_page_preview=True)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Поиск отменён. Для начала нового нажмите /start.")
+    return ConversationHandler.END
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('help', help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            CITY: [CallbackQueryHandler(city_choice, pattern='^city_')],
+            ACCURACY: [CallbackQueryHandler(accuracy_choice, pattern='^accuracy_')],
+            QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_query)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True
+    )
+    app.add_handler(conv_handler)
+    # Для кнопки "новый поиск" после завершения
+    app.add_handler(CallbackQueryHandler(new_search_callback, pattern='^new_search$'))
+    # На случай, если кто-то напишет текст вне диалога – направим на /start
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
+
     print("Бот запущен.")
     app.run_polling()
 
